@@ -164,3 +164,4 @@ impl CapturedLog {
         })
     }
 }
+
