@@ -1,108 +1,90 @@
 use pgrx::bgworkers::*;
+use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::pg_sys;
 use pgrx::prelude::*;
+use std::sync::LazyLock;
 use std::time::Duration;
+use std::ffi::{CStr, CString};
+
+pub mod config;
+pub mod log_capture;
+
+use config::http::HttpAdapter;
+use config::Adapter;
+
+static HTTP_ADAPTER: LazyLock<HttpAdapter> = LazyLock::new(HttpAdapter::new);
+
+pub static HTTP_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub static HTTP_ENDPOINT: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+pub static HTTP_API_KEY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+pub static HTTP_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(5000);
+pub static HTTP_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(100);
+
+pub static POLL_INTERVAL_S: GucSetting<i32> = GucSetting::<i32>::new(10);
+
+fn register_guc() {
+    GucRegistry::define_bool_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.http.enabled\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Enable HTTP log export\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Set to true to enable exporting logs via HTTP\0") },
+        &HTTP_ENABLED,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.http.endpoint\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"HTTP endpoint URL\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"URL to send logs to via HTTP\0") },
+        &HTTP_ENDPOINT,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.http.api_key\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"HTTP API key\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"API key for authentication with HTTP endpoint\0") },
+        &HTTP_API_KEY,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.http.timeout_ms\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"HTTP request timeout in milliseconds\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Timeout for HTTP requests\0") },
+        &HTTP_TIMEOUT_MS,
+        100,
+        60000,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.http.batch_size\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"HTTP batch size\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Number of logs to batch before sending\0") },
+        &HTTP_BATCH_SIZE,
+        1,
+        1000,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.poll_interval_s\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Log poll interval in seconds\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"How often the background worker checks for new logs to send\0") },
+        &POLL_INTERVAL_S,
+        1,
+        3600,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+}
 
 ::pgrx::pg_module_magic!();
-
-mod log_capture {
-    use pgrx::pg_sys::ErrorData;
-    use std::sync::Mutex;
-
-    static CAPTURED_LOGS: Mutex<Vec<CapturedLog>> = Mutex::new(Vec::new());
-
-    #[derive(Debug, Clone)]
-    #[allow(dead_code)]
-    pub struct CapturedLog {
-        pub elevel: i32,
-        pub message: String,
-        pub detail: Option<String>,
-        pub hint: Option<String>,
-        pub context: Option<String>,
-        pub sqlerrcode: i32,
-        pub filename: Option<String>,
-        pub lineno: i32,
-        pub funcname: Option<String>,
-    }
-
-    impl From<&ErrorData> for CapturedLog {
-        fn from(ed: &ErrorData) -> Self {
-            fn c_str_to_string(ptr: *const std::ffi::c_char) -> Option<String> {
-                if ptr.is_null() {
-                    None
-                } else {
-                    unsafe {
-                        std::ffi::CStr::from_ptr(ptr)
-                            .to_str()
-                            .ok()
-                            .map(|s| s.to_string())
-                    }
-                }
-            }
-
-            fn c_str_to_string_mut(ptr: *mut std::ffi::c_char) -> Option<String> {
-                if ptr.is_null() {
-                    None
-                } else {
-                    unsafe {
-                        std::ffi::CStr::from_ptr(ptr)
-                            .to_str()
-                            .ok()
-                            .map(|s| s.to_string())
-                    }
-                }
-            }
-
-            CapturedLog {
-                elevel: ed.elevel,
-                message: c_str_to_string_mut(ed.message).unwrap_or_default(),
-                detail: c_str_to_string_mut(ed.detail),
-                hint: c_str_to_string_mut(ed.hint),
-                context: c_str_to_string_mut(ed.context),
-                sqlerrcode: ed.sqlerrcode,
-                filename: c_str_to_string(ed.filename),
-                lineno: ed.lineno,
-                funcname: c_str_to_string(ed.funcname),
-            }
-        }
-    }
-
-    pub fn add_log(log: CapturedLog) {
-        if let Ok(mut logs) = CAPTURED_LOGS.lock() {
-            logs.push(log);
-            if logs.len() > 1000 {
-                logs.drain(0..500);
-            }
-        }
-    }
-
-    pub fn get_logs() -> Vec<CapturedLog> {
-        CAPTURED_LOGS
-            .lock()
-            .map(|logs| logs.clone())
-            .unwrap_or_default()
-    }
-
-    #[allow(dead_code)]
-    pub fn clear() {
-        if let Ok(mut logs) = CAPTURED_LOGS.lock() {
-            logs.clear();
-        }
-    }
-
-    unsafe extern "C-unwind" fn emit_log_hook_func(edata: *mut pgrx::pg_sys::ErrorData) {
-        if !edata.is_null() {
-            let log = CapturedLog::from(&*edata);
-            add_log(log);
-        }
-    }
-
-    pub fn set_hook() {
-        unsafe {
-            pgrx::pg_sys::emit_log_hook = Some(emit_log_hook_func);
-        }
-    }
-}
 
 #[pg_extern]
 fn get_captured_logs_count() -> i64 {
@@ -112,6 +94,7 @@ fn get_captured_logs_count() -> i64 {
 #[allow(non_snake_case)]
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    register_guc();
     log_capture::set_hook();
 
     BackgroundWorkerBuilder::new("pg_turret")
@@ -129,28 +112,35 @@ pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
 
     log!("pg_turret background worker starting");
 
-    while BackgroundWorker::wait_latch(Some(Duration::from_secs(10))) {
-        if BackgroundWorker::sighup_received() {}
+    loop {
+        // Sync configuration from GUCs to our internal state
+        config::http::HttpAdapter::set_enabled(HTTP_ENABLED.get());
+        config::http::set_http_config(config::http::HttpConfig {
+            endpoint: HTTP_ENDPOINT.get().and_then(|cs| cs.to_str().ok().map(|s| s.to_string())).unwrap_or_default(),
+            api_key: HTTP_API_KEY.get().and_then(|cs| cs.to_str().ok().map(|s| s.to_string())),
+            timeout_ms: HTTP_TIMEOUT_MS.get() as u64,
+            batch_size: HTTP_BATCH_SIZE.get() as usize,
+        });
+
+        let poll_interval = Duration::from_secs(POLL_INTERVAL_S.get() as u64);
+
+        if !BackgroundWorker::wait_latch(Some(poll_interval)) {
+            // Timeout reached, or signal received
+        }
+
+        if BackgroundWorker::sighup_received() {
+            log!("pg_turret configuration reload signaled");
+        }
 
         BackgroundWorker::transaction(|| {
-            let logs = log_capture::get_logs();
+            let logs = log_capture::consume_logs();
             if !logs.is_empty() {
-                for log in &logs {
-                    let level = match log.elevel {
-                        0..=14 => "DEBUG",
-                        15..=17 => "INFO",
-                        18..=24 => "LOG",
-                        25..=27 => "WARNING",
-                        28 => "ERROR",
-                        29 => "FATAL",
-                        30 => "PANIC",
-                        _ => "UNKNOWN",
-                    };
-                    eprintln!("[{}] {}", level, log.message);
+                if HTTP_ADAPTER.is_enabled() {
+                    if let Err(e) = HTTP_ADAPTER.send(&logs) {
+                        eprintln!("pg_turret: HTTP adapter error: {}", e);
+                    }
                 }
             }
         });
     }
-
-    log!("pg_turret background worker exiting");
 }
