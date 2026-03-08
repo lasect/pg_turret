@@ -28,7 +28,7 @@ fn register_guc() {
         unsafe { CStr::from_bytes_with_nul_unchecked(b"Enable HTTP log export\0") },
         unsafe { CStr::from_bytes_with_nul_unchecked(b"Set to true to enable exporting logs via HTTP\0") },
         &HTTP_ENABLED,
-        GucContext::Postmaster,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
@@ -37,7 +37,7 @@ fn register_guc() {
         unsafe { CStr::from_bytes_with_nul_unchecked(b"HTTP endpoint URL\0") },
         unsafe { CStr::from_bytes_with_nul_unchecked(b"URL to send logs to via HTTP\0") },
         &HTTP_ENDPOINT,
-        GucContext::Postmaster,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
@@ -46,7 +46,7 @@ fn register_guc() {
         unsafe { CStr::from_bytes_with_nul_unchecked(b"HTTP API key\0") },
         unsafe { CStr::from_bytes_with_nul_unchecked(b"API key for authentication with HTTP endpoint\0") },
         &HTTP_API_KEY,
-        GucContext::Postmaster,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
@@ -57,7 +57,7 @@ fn register_guc() {
         &HTTP_TIMEOUT_MS,
         100,
         60000,
-        GucContext::Postmaster,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
@@ -68,7 +68,7 @@ fn register_guc() {
         &HTTP_BATCH_SIZE,
         1,
         1000,
-        GucContext::Postmaster,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
@@ -79,7 +79,7 @@ fn register_guc() {
         &POLL_INTERVAL_S,
         1,
         3600,
-        GucContext::Postmaster,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 }
@@ -104,6 +104,21 @@ pub extern "C-unwind" fn _PG_init() {
         .load();
 }
 
+fn sync_worker_config() {
+    config::http::HttpAdapter::set_enabled(HTTP_ENABLED.get());
+    config::http::set_http_config(config::http::HttpConfig {
+        endpoint: HTTP_ENDPOINT
+            .get()
+            .and_then(|cs| cs.to_str().ok().map(|s| s.to_string()))
+            .unwrap_or_default(),
+        api_key: HTTP_API_KEY
+            .get()
+            .and_then(|cs| cs.to_str().ok().map(|s| s.to_string())),
+        timeout_ms: HTTP_TIMEOUT_MS.get() as u64,
+        batch_size: HTTP_BATCH_SIZE.get() as usize,
+    });
+}
+
 #[pg_guard]
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
@@ -112,16 +127,10 @@ pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
 
     log!("pg_turret background worker starting");
 
-    loop {
-        // Sync configuration from GUCs to our internal state
-        config::http::HttpAdapter::set_enabled(HTTP_ENABLED.get());
-        config::http::set_http_config(config::http::HttpConfig {
-            endpoint: HTTP_ENDPOINT.get().and_then(|cs| cs.to_str().ok().map(|s| s.to_string())).unwrap_or_default(),
-            api_key: HTTP_API_KEY.get().and_then(|cs| cs.to_str().ok().map(|s| s.to_string())),
-            timeout_ms: HTTP_TIMEOUT_MS.get() as u64,
-            batch_size: HTTP_BATCH_SIZE.get() as usize,
-        });
+    // Initial sync
+    sync_worker_config();
 
+    loop {
         let poll_interval = Duration::from_secs(POLL_INTERVAL_S.get() as u64);
 
         if !BackgroundWorker::wait_latch(Some(poll_interval)) {
@@ -130,6 +139,7 @@ pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
 
         if BackgroundWorker::sighup_received() {
             log!("pg_turret configuration reload signaled");
+            sync_worker_config();
         }
 
         BackgroundWorker::transaction(|| {

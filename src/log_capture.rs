@@ -1,10 +1,12 @@
-use pgrx::pg_sys::ErrorData;
+use pgrx::pg_sys::{self, ErrorData};
 use std::sync::Mutex;
+use chrono::Utc;
 
 static CAPTURED_LOGS: Mutex<Vec<CapturedLog>> = Mutex::new(Vec::new());
 
 #[derive(Debug, Clone)]
 pub struct CapturedLog {
+    pub timestamp: String,
     pub elevel: i32,
     pub message: String,
     pub detail: Option<String>,
@@ -14,6 +16,9 @@ pub struct CapturedLog {
     pub filename: Option<String>,
     pub lineno: i32,
     pub funcname: Option<String>,
+    pub database: Option<String>,
+    pub user: Option<String>,
+    pub query: Option<String>,
 }
 
 impl From<&ErrorData> for CapturedLog {
@@ -44,7 +49,40 @@ impl From<&ErrorData> for CapturedLog {
             }
         }
 
+        fn c_str_to_string_palloc(ptr: *mut std::ffi::c_char) -> Option<String> {
+            if ptr.is_null() {
+                None
+            } else {
+                let s = unsafe {
+                    std::ffi::CStr::from_ptr(ptr)
+                        .to_str()
+                        .ok()
+                        .map(|s| s.to_string())
+                };
+                unsafe { pg_sys::pfree(ptr as *mut _) };
+                s
+            }
+        }
+
+        let database = unsafe {
+            if pg_sys::MyDatabaseId == 0.into() {
+                None
+            } else {
+                c_str_to_string_palloc(pg_sys::get_database_name(pg_sys::MyDatabaseId))
+            }
+        };
+        let user = unsafe {
+            let user_id = pg_sys::GetUserId();
+            if user_id == 0.into() {
+                None
+            } else {
+                c_str_to_string_palloc(pg_sys::GetUserNameFromId(user_id, false))
+            }
+        };
+        let query = unsafe { c_str_to_string(pg_sys::debug_query_string) };
+
         CapturedLog {
+            timestamp: Utc::now().to_rfc3339(),
             elevel: ed.elevel,
             message: c_str_to_string_mut(ed.message).unwrap_or_default(),
             detail: c_str_to_string_mut(ed.detail),
@@ -54,6 +92,9 @@ impl From<&ErrorData> for CapturedLog {
             filename: c_str_to_string(ed.filename),
             lineno: ed.lineno,
             funcname: c_str_to_string(ed.funcname),
+            database,
+            user,
+            query,
         }
     }
 }

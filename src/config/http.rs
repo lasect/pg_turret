@@ -140,18 +140,19 @@ impl CapturedLog {
         use serde_json::json;
 
         let level = match self.elevel {
-            0..=14 => "DEBUG",
-            15..=17 => "INFO",
-            18..=24 => "LOG",
-            25..=27 => "WARNING",
-            28 => "ERROR",
-            29 => "FATAL",
-            30 => "PANIC",
+            10..=14 => "DEBUG",
+            15 | 16 => "LOG",
+            17 => "INFO",
+            18 => "NOTICE",
+            19 => "WARNING",
+            20 => "ERROR",
+            21 => "FATAL",
+            22 => "PANIC",
             _ => "UNKNOWN",
         };
 
         json!({
-            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "timestamp": self.timestamp,
             "level": level,
             "message": self.message,
             "detail": self.detail,
@@ -161,6 +162,9 @@ impl CapturedLog {
             "filename": self.filename,
             "lineno": self.lineno,
             "funcname": self.funcname,
+            "database": self.database,
+            "user": self.user,
+            "query": self.query,
         })
     }
 }
