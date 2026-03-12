@@ -73,51 +73,50 @@ impl std::fmt::Display for AdapterError {
 impl std::error::Error for AdapterError {}
 
 pub fn set_stream_enabled(stream: StreamType, enabled: bool) {
-    if let Ok(mut flags) = ENABLED_STREAMS.lock() {
-        match stream {
-            StreamType::Http => flags.http = enabled,
-            StreamType::Sentry => flags.sentry = enabled,
-            StreamType::Axiom => flags.axiom = enabled,
-            StreamType::Datadog => flags.datadog = enabled,
-            StreamType::WebSockets => flags.websockets = enabled,
-            StreamType::S3 => flags.s3 = enabled,
-        }
+    let mut flags = ENABLED_STREAMS
+        .lock()
+        .expect("ENABLED_STREAMS mutex poisoned");
+    match stream {
+        StreamType::Http => flags.http = enabled,
+        StreamType::Sentry => flags.sentry = enabled,
+        StreamType::Axiom => flags.axiom = enabled,
+        StreamType::Datadog => flags.datadog = enabled,
+        StreamType::WebSockets => flags.websockets = enabled,
+        StreamType::S3 => flags.s3 = enabled,
     }
 }
 
 pub fn is_stream_enabled(stream: StreamType) -> bool {
-    ENABLED_STREAMS
+    let flags = ENABLED_STREAMS
         .lock()
-        .map(|flags| flags.is_enabled(stream))
-        .unwrap_or(false)
+        .expect("ENABLED_STREAMS mutex poisoned");
+    flags.is_enabled(stream)
 }
 
 pub fn get_enabled_streams() -> Vec<StreamType> {
-    ENABLED_STREAMS
+    let flags = ENABLED_STREAMS
         .lock()
-        .map(|flags| {
-            let mut enabled = Vec::new();
-            if flags.http {
-                enabled.push(StreamType::Http);
-            }
-            if flags.sentry {
-                enabled.push(StreamType::Sentry);
-            }
-            if flags.axiom {
-                enabled.push(StreamType::Axiom);
-            }
-            if flags.datadog {
-                enabled.push(StreamType::Datadog);
-            }
-            if flags.websockets {
-                enabled.push(StreamType::WebSockets);
-            }
-            if flags.s3 {
-                enabled.push(StreamType::S3);
-            }
-            enabled
-        })
-        .unwrap_or_default()
+        .expect("ENABLED_STREAMS mutex poisoned");
+    let mut enabled = Vec::new();
+    if flags.http {
+        enabled.push(StreamType::Http);
+    }
+    if flags.sentry {
+        enabled.push(StreamType::Sentry);
+    }
+    if flags.axiom {
+        enabled.push(StreamType::Axiom);
+    }
+    if flags.datadog {
+        enabled.push(StreamType::Datadog);
+    }
+    if flags.websockets {
+        enabled.push(StreamType::WebSockets);
+    }
+    if flags.s3 {
+        enabled.push(StreamType::S3);
+    }
+    enabled
 }
 
 pub fn reload_config() {
