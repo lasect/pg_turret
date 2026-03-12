@@ -14,8 +14,8 @@ static SHMEM_READY: AtomicBool = AtomicBool::new(false);
 
 /// Maximum number of log entries in the shared memory ring buffer.
 /// This is the compile-time maximum. The actual used size is controlled by GUC.
-const RING_BUFFER_MAX_CAPACITY: usize = 65536;
-const RING_BUFFER_DEFAULT_CAPACITY: usize = 1024;
+const RING_BUFFER_MAX_CAPACITY: usize = 1024;
+const RING_BUFFER_DEFAULT_CAPACITY: usize = 256;
 
 /// Maximum length for string fields stored in shared memory.
 const MAX_SHORT_STR: usize = 256;
@@ -113,16 +113,22 @@ pub fn should_capture_log(level: i32, message: &str) -> bool {
 }
 
 pub fn add_to_retry_queue(log: CapturedLog) {
-    add_batch_to_retry_queue(vec![log]);
+    add_batch_to_retry_queue(vec![log], 0);
 }
 
-pub fn add_batch_to_retry_queue(logs: Vec<CapturedLog>) {
+pub fn add_batch_to_retry_queue(logs: Vec<CapturedLog>, attempts: u32) {
     if logs.is_empty() {
         return;
     }
     
     let config = RETRY_CONFIG.lock().unwrap();
     if !config.enabled {
+        return;
+    }
+    
+    let max_attempts = config.max_attempts;
+    if attempts >= max_attempts {
+        LOGS_RETRY_FAILED.fetch_add(logs.len() as u64, Ordering::SeqCst);
         return;
     }
     
@@ -134,32 +140,18 @@ pub fn add_batch_to_retry_queue(logs: Vec<CapturedLog>) {
             LOGS_RETRY_FAILED.fetch_add(1, Ordering::SeqCst);
             queue.pop_front();
         }
-        queue.push_back((log, 0));
+        queue.push_back((log, attempts));
     }
 }
 
-pub fn get_retry_logs() -> Vec<CapturedLog> {
+pub fn get_retry_logs() -> Vec<(CapturedLog, u32)> {
     let config = RETRY_CONFIG.lock().unwrap();
     if !config.enabled {
         return vec![];
     }
     
     let mut queue = RETRY_QUEUE.lock().unwrap();
-    let max_attempts = config.max_attempts;
-    let mut result = Vec::with_capacity(queue.len());
-    let mut remaining = VecDeque::new();
-    
-    while let Some((log, attempts)) = queue.pop_front() {
-        if attempts < max_attempts {
-            result.push(log.clone());
-            remaining.push_back((log, attempts + 1));
-        } else {
-            LOGS_RETRY_FAILED.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-    
-    *queue = remaining;
-    result
+    queue.drain(..).collect()
 }
 
 pub fn clear_retry_queue() {
@@ -565,46 +557,10 @@ fn c_str_mut_to_option(ptr: *mut std::ffi::c_char) -> Option<String> {
 fn build_shm_entry(ed: &ErrorData) -> ShmLogEntry {
     let timestamp = Utc::now().to_rfc3339();
 
-    // Only attempt catalog lookups when the database system is fully
-    // initialized. During early startup (initdb, recovery, bgworker
-    // init), MyDatabaseId is InvalidOid and catalog access would crash.
-    let database_str = unsafe {
-        let db_id = pg_sys::MyDatabaseId;
-        if db_id != pg_sys::InvalidOid && pg_sys::IsTransactionState() {
-            let name_ptr = pg_sys::get_database_name(db_id);
-            if !name_ptr.is_null() {
-                let s = CStr::from_ptr(name_ptr)
-                    .to_str()
-                    .ok()
-                    .map(|s| s.to_string());
-                pg_sys::pfree(name_ptr as *mut _);
-                s
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
-
-    let user_str = unsafe {
-        let user_id = pg_sys::GetUserId();
-        if user_id != pg_sys::InvalidOid && pg_sys::IsTransactionState() {
-            let name_ptr = pg_sys::GetUserNameFromId(user_id, true);
-            if !name_ptr.is_null() {
-                let s = CStr::from_ptr(name_ptr)
-                    .to_str()
-                    .ok()
-                    .map(|s| s.to_string());
-                pg_sys::pfree(name_ptr as *mut _);
-                s
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
+    // Note: We avoid catalog lookups (get_database_name, GetUserNameFromId) here
+    // because they can crash during initdb/early startup when catalogs aren't ready.
+    // The ErrorData struct itself contains some fields but not database/user names.
+    // Those can be added later if needed through other means.
 
     let query_str = unsafe { c_str_to_option(pg_sys::debug_query_string) };
     let message_str = c_str_mut_to_option(ed.message).unwrap_or_default();
@@ -626,8 +582,8 @@ fn build_shm_entry(ed: &ErrorData) -> ShmLogEntry {
         filename: ShmOptStr::from_option(filename_str.as_deref()),
         lineno: ed.lineno,
         funcname: ShmOptStr::from_option(funcname_str.as_deref()),
-        database: ShmOptStr::from_option(database_str.as_deref()),
-        user: ShmOptStr::from_option(user_str.as_deref()),
+        database: ShmOptStr::none(),
+        user: ShmOptStr::none(),
         query: ShmOptStr::from_option(query_str.as_deref()),
     }
 }

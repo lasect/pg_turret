@@ -243,6 +243,7 @@ pub extern "C-unwind" fn _PG_init() {
     register_guc();
 
     // init shared memory ring buffer for log entries
+    // This must be in _PG_init, not deferred
     pg_shmem_init!(LOG_RING_BUFFER);
 
     // chain our own shmem_startup_hook once pg_shmem_init! is setup so it firing means the shared memory and LWLocks are ready to use.
@@ -252,8 +253,10 @@ pub extern "C-unwind" fn _PG_init() {
         pg_sys::shmem_startup_hook = Some(turret_shmem_startup);
     }
 
-    log_capture::set_hook();
-
+    // Note: We don't set the emit_log_hook here because it would be called
+    // during initdb (bootstrap mode) when shared memory isn't fully ready.
+    // The hook is set in turret_shmem_startup() after shmem is initialized.
+    
     // Initialize metrics
     metrics::init_metrics();
 
@@ -265,7 +268,7 @@ pub extern "C-unwind" fn _PG_init() {
         } else {
             format!("pg_turret_{}", worker_id)
         };
-        
+
         BackgroundWorkerBuilder::new(&worker_name)
             .set_function("background_worker_main")
             .set_library("pg_turret")
@@ -286,6 +289,8 @@ unsafe extern "C-unwind" fn turret_shmem_startup() {
     }
     // now the ring buffer LWLock is initialized, safe to use.
     log_capture::mark_shmem_ready();
+    // Now safe to set the log hook - this runs after postmaster starts
+    log_capture::set_hook();
 }
 
 fn sync_worker_config() {
@@ -344,14 +349,24 @@ pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
         }
 
         // First, try to send any logs pending in retry queue
-        let retry_logs = log_capture::get_retry_logs();
-        if !retry_logs.is_empty() && HTTP_ADAPTER.is_enabled() {
-            if let Err(e) = HTTP_ADAPTER.send(&retry_logs) {
+        let retry_data = log_capture::get_retry_logs();
+        if !retry_data.is_empty() && HTTP_ADAPTER.is_enabled() {
+            let mut logs = Vec::with_capacity(retry_data.len());
+            let mut attempts = Vec::with_capacity(retry_data.len());
+            for (log, attempt) in retry_data {
+                logs.push(log);
+                attempts.push(attempt);
+            }
+
+            if let Err(e) = HTTP_ADAPTER.send(&logs) {
                 pgrx::log!("pg_turret: failed to send retry logs: {}", e.message);
-                log_capture::add_batch_to_retry_queue(retry_logs);
-                } else {
-                    log_capture::LOGS_SENT.fetch_add(retry_logs.len() as u64, std::sync::atomic::Ordering::SeqCst);
+                // Re-add with incremented attempts
+                for (log, attempt) in logs.into_iter().zip(attempts) {
+                    log_capture::add_batch_to_retry_queue(vec![log], attempt + 1);
                 }
+            } else {
+                log_capture::LOGS_SENT.fetch_add(logs.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            }
         }
 
         // Then consume new logs from ring buffer
@@ -360,7 +375,7 @@ pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
             if HTTP_ADAPTER.is_enabled() {
                 if let Err(e) = HTTP_ADAPTER.send(&logs) {
                     pgrx::log!("pg_turret: failed to send logs: {}", e.message);
-                    log_capture::add_batch_to_retry_queue(logs);
+                    log_capture::add_batch_to_retry_queue(logs, 1);
                 } else {
                     log_capture::LOGS_SENT.fetch_add(logs.len() as u64, std::sync::atomic::Ordering::SeqCst);
                 }
