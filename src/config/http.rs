@@ -7,12 +7,31 @@ use std::sync::{LazyLock, Mutex};
 
 static HTTP_ENABLED: AtomicBool = AtomicBool::new(false);
 
-static HTTP_CLIENT: LazyLock<Option<reqwest::blocking::Client>> = LazyLock::new(|| {
-    reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_millis(5000))
+static HTTP_CLIENT: LazyLock<Mutex<Option<reqwest::blocking::Client>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn get_or_create_client(timeout_ms: u64) -> Result<reqwest::blocking::Client, AdapterError> {
+    let mut client_guard = HTTP_CLIENT.lock().expect("HTTP_CLIENT mutex poisoned");
+
+    if let Some(ref client) = *client_guard {
+        return Ok(client.clone());
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(timeout_ms))
         .build()
-        .ok()
-});
+        .map_err(|e| AdapterError {
+            message: format!("Failed to create HTTP client: {}", e),
+        })?;
+
+    *client_guard = Some(client.clone());
+    Ok(client)
+}
+
+pub fn rebuild_http_client() {
+    let mut client_guard = HTTP_CLIENT.lock().expect("HTTP_CLIENT mutex poisoned");
+    *client_guard = None;
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HttpConfig {
@@ -40,12 +59,12 @@ static HTTP_CONFIG: LazyLock<Mutex<HttpConfig>> =
 
 pub fn set_http_config(config: HttpConfig) {
     let mut cfg = HTTP_CONFIG.lock().expect("HTTP_CONFIG mutex poisoned");
-    if cfg.endpoint != config.endpoint
-        || cfg.api_key != config.api_key
-        || cfg.timeout_ms != config.timeout_ms
-        || cfg.batch_size != config.batch_size
-    {
-        *cfg = config;
+    let needs_rebuild = cfg.timeout_ms != config.timeout_ms;
+    *cfg = config;
+    drop(cfg);
+
+    if needs_rebuild {
+        rebuild_http_client();
     }
 }
 
@@ -116,9 +135,7 @@ impl Adapter for HttpAdapter {
 
         #[cfg(feature = "std")]
         {
-            let client = HTTP_CLIENT.as_ref().ok_or_else(|| AdapterError {
-                message: "Failed to create HTTP client".to_string(),
-            })?;
+            let client = get_or_create_client(config.timeout_ms)?;
 
             // Process logs in batches
             for batch in logs.chunks(config.batch_size) {
