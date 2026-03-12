@@ -348,10 +348,7 @@ pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
         if !retry_logs.is_empty() && HTTP_ADAPTER.is_enabled() {
             if let Err(e) = HTTP_ADAPTER.send(&retry_logs) {
                 pgrx::log!("pg_turret: failed to send retry logs: {}", e.message);
-                // Re-add to retry queue with incremented attempt count
-                for log in retry_logs {
-                    log_capture::add_to_retry_queue(log);
-                }
+                log_capture::add_batch_to_retry_queue(retry_logs);
                 } else {
                     log_capture::LOGS_SENT.fetch_add(retry_logs.len() as u64, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -363,10 +360,7 @@ pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
             if HTTP_ADAPTER.is_enabled() {
                 if let Err(e) = HTTP_ADAPTER.send(&logs) {
                     pgrx::log!("pg_turret: failed to send logs: {}", e.message);
-                    // Add failed logs to retry queue
-                    for log in logs {
-                        log_capture::add_to_retry_queue(log);
-                    }
+                    log_capture::add_batch_to_retry_queue(logs);
                 } else {
                     log_capture::LOGS_SENT.fetch_add(logs.len() as u64, std::sync::atomic::Ordering::SeqCst);
                 }
