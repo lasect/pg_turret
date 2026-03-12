@@ -17,6 +17,10 @@ Postgres logs → pg_turret → structured events → Observability systems
 - **Structured JSON**: Logs are converted to machine-readable JSON objects.
 - **Multiple Adapters**: Extensible architecture supporting various destinations.
 - **Batched Delivery**: Configurable batch sizes and polling intervals.
+- **Log Filtering**: Filter by log level and regex patterns (include/exclude).
+- **Retry Queue**: Automatic retry for failed submissions with configurable attempts.
+- **Multiple Workers**: Scale export throughput with multiple background workers.
+- **Compression**: Optional gzip compression for HTTP payloads.
 
 ---
 
@@ -59,6 +63,24 @@ shared_preload_libraries = 'pg_turret'
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `pg_turret.poll_interval_s` | `int` | `10` | How often (in seconds) background workers check for new logs. |
+| `pg_turret.ring_buffer_size` | `int` | `1024` | Maximum log entries in shared memory ring buffer (128-65536). |
+| `pg_turret.num_workers` | `int` | `1` | Number of background workers (1-8). |
+
+### Filter Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `pg_turret.filter.level_min` | `int` | `10` | Minimum log level to capture (10=DEBUG, 17=INFO, 19=WARNING, 20=ERROR, 21=FATAL). |
+| `pg_turret.filter.pattern` | `string` | `''` | Regex pattern - only logs matching this pattern will be captured. |
+| `pg_turret.filter.pattern_exclude` | `string` | `''` | Regex pattern - logs matching this pattern will be excluded. |
+
+### Retry Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `pg_turret.retry.enabled` | `bool` | `true` | Enable retry queue for failed submissions. |
+| `pg_turret.retry.max_attempts` | `int` | `3` | Maximum retry attempts (1-10). |
+| `pg_turret.retry.queue_size` | `int` | `512` | Maximum failed entries to keep for retry (64-4096). |
 
 ---
 
@@ -79,6 +101,7 @@ Exports logs to any HTTP(S) endpoint.
 | `pg_turret.http.api_key` | `string` | `''` | Optional Bearer token for the `Authorization` header. |
 | `pg_turret.http.batch_size` | `int` | `100` | Max logs per request. |
 | `pg_turret.http.timeout_ms` | `int` | `5000` | Request timeout. |
+| `pg_turret.http.compression` | `bool` | `false` | Enable gzip compression for request bodies. |
 
 ### Other Adapters (Coming Soon)
 - **Sentry**: Native integration for error tracking.
@@ -99,10 +122,15 @@ Events are sent as a JSON array. Example object:
   "level": "ERROR",
   "message": "duplicate key value violates unique constraint",
   "detail": "Key (id)=(1) already exists.",
+  "hint": "...",
+  "context": "...",
   "sqlerrcode": 23505,
   "filename": "nbtinsert.c",
   "lineno": 671,
-  "funcname": "_bt_check_unique"
+  "funcname": "_bt_check_unique",
+  "database": "mydb",
+  "user": "postgres",
+  "query": "INSERT INTO ..."
 }
 ```
 
