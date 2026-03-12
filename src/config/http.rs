@@ -1,10 +1,18 @@
 use super::{Adapter, AdapterError, StreamType};
-use crate::log_capture::CapturedLog;
+use crate::log_capture::{CapturedLog, SerializableLog};
 use serde::Serialize;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 static HTTP_ENABLED: AtomicBool = AtomicBool::new(false);
+
+static HTTP_CLIENT: LazyLock<Option<reqwest::blocking::Client>> = LazyLock::new(|| {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(5000))
+        .build()
+        .ok()
+});
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HttpConfig {
@@ -12,6 +20,7 @@ pub struct HttpConfig {
     pub api_key: Option<String>,
     pub timeout_ms: u64,
     pub batch_size: usize,
+    pub compression: bool,
 }
 
 impl Default for HttpConfig {
@@ -21,6 +30,7 @@ impl Default for HttpConfig {
             api_key: None,
             timeout_ms: 5000,
             batch_size: 100,
+            compression: false,
         }
     }
 }
@@ -29,20 +39,31 @@ static HTTP_CONFIG: LazyLock<Mutex<HttpConfig>> =
     LazyLock::new(|| Mutex::new(HttpConfig::default()));
 
 pub fn set_http_config(config: HttpConfig) {
-    if let Ok(mut cfg) = HTTP_CONFIG.lock() {
+    let mut cfg = HTTP_CONFIG.lock().expect("HTTP_CONFIG mutex poisoned");
+    if cfg.endpoint != config.endpoint
+        || cfg.api_key != config.api_key
+        || cfg.timeout_ms != config.timeout_ms
+        || cfg.batch_size != config.batch_size
+    {
         *cfg = config;
     }
 }
 
 pub fn get_http_config() -> HttpConfig {
-    HTTP_CONFIG
-        .lock()
-        .map(|cfg| cfg.clone())
-        .unwrap_or_default()
+    let cfg = HTTP_CONFIG.lock().expect("HTTP_CONFIG mutex poisoned");
+    cfg.clone()
 }
 
 pub struct HttpAdapter {
     enabled: &'static AtomicBool,
+}
+
+impl std::fmt::Debug for HttpAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpAdapter")
+            .field("enabled", &self.enabled.load(Ordering::SeqCst))
+            .finish()
+    }
 }
 
 impl HttpAdapter {
@@ -95,12 +116,9 @@ impl Adapter for HttpAdapter {
 
         #[cfg(feature = "std")]
         {
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_millis(config.timeout_ms))
-                .build()
-                .map_err(|e| AdapterError {
-                    message: format!("Failed to create HTTP client: {}", e),
-                })?;
+            let client = HTTP_CLIENT.as_ref().ok_or_else(|| AdapterError {
+                message: "Failed to create HTTP client".to_string(),
+            })?;
 
             // Process logs in batches
             for batch in logs.chunks(config.batch_size) {
@@ -110,20 +128,37 @@ impl Adapter for HttpAdapter {
                     request = request.header("Authorization", format!("Bearer {}", api_key));
                 }
 
-                let payload: Vec<serde_json::Value> =
-                    batch.iter().map(|log| log.to_json()).collect();
+                let serializable_batch: Vec<SerializableLog> =
+                    batch.iter().map(SerializableLog::from).collect();
 
-                let body = serde_json::to_vec(&payload).map_err(|e| AdapterError {
+                let body = serde_json::to_vec(&serializable_batch).map_err(|e| AdapterError {
                     message: format!("Failed to serialize logs: {}", e),
                 })?;
 
-                let response = request
-                    .header("Content-Type", "application/json")
-                    .body(body)
-                    .send()
-                    .map_err(|e| AdapterError {
-                        message: format!("Failed to send logs to HTTP endpoint: {}", e),
+                // Apply gzip compression if enabled
+                if config.compression {
+                    let mut encoder =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    encoder.write_all(&body).map_err(|e| AdapterError {
+                        message: format!("Failed to compress logs: {}", e),
                     })?;
+                    let compressed = encoder.finish().map_err(|e| AdapterError {
+                        message: format!("Failed to finish compression: {}", e),
+                    })?;
+
+                    request = request
+                        .header("Content-Encoding", "gzip")
+                        .header("Content-Type", "application/json")
+                        .body(compressed);
+                } else {
+                    request = request
+                        .header("Content-Type", "application/json")
+                        .body(body);
+                }
+
+                let response = request.send().map_err(|e| AdapterError {
+                    message: format!("Failed to send logs to HTTP endpoint: {}", e),
+                })?;
 
                 if !response.status().is_success() {
                     return Err(AdapterError {
@@ -133,40 +168,11 @@ impl Adapter for HttpAdapter {
             }
         }
 
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = (logs, config);
+        }
+
         Ok(())
-    }
-}
-
-impl CapturedLog {
-    pub fn to_json(&self) -> serde_json::Value {
-        use serde_json::json;
-
-        let level = match self.elevel {
-            10..=14 => "DEBUG",
-            15 | 16 => "LOG",
-            17 => "INFO",
-            18 => "NOTICE",
-            19 => "WARNING",
-            20 => "ERROR",
-            21 => "FATAL",
-            22 => "PANIC",
-            _ => "UNKNOWN",
-        };
-
-        json!({
-            "timestamp": self.timestamp,
-            "level": level,
-            "message": self.message,
-            "detail": self.detail,
-            "hint": self.hint,
-            "context": self.context,
-            "sqlerrcode": self.sqlerrcode,
-            "filename": self.filename,
-            "lineno": self.lineno,
-            "funcname": self.funcname,
-            "database": self.database,
-            "user": self.user,
-            "query": self.query,
-        })
     }
 }
