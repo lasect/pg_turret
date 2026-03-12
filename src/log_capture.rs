@@ -86,41 +86,56 @@ pub fn set_retry_config(config: RetryConfig) {
 }
 
 pub fn should_capture_log(level: i32, message: &str) -> bool {
-    // Check level filter
-    if level < FILTER_CONFIG.lock().unwrap().level_min {
+    let (config, pattern, pattern_exclude) = {
+        let cfg = FILTER_CONFIG.lock().unwrap();
+        let pat = FILTER_PATTERN.lock().unwrap();
+        let pat_ex = FILTER_PATTERN_EXCLUDE.lock().unwrap();
+        (cfg.clone(), pat.clone(), pat_ex.clone())
+    };
+
+    if level < config.level_min {
         return false;
     }
-    
-    // Check include pattern
-    if let Some(ref pattern) = *FILTER_PATTERN.lock().unwrap() {
-        if !pattern.is_match(message) {
+
+    if let Some(ref re) = pattern {
+        if !re.is_match(message) {
             return false;
         }
     }
-    
-    // Check exclude pattern
-    if let Some(ref pattern) = *FILTER_PATTERN_EXCLUDE.lock().unwrap() {
-        if pattern.is_match(message) {
+
+    if let Some(ref re) = pattern_exclude {
+        if re.is_match(message) {
             return false;
         }
     }
-    
+
     true
 }
 
 pub fn add_to_retry_queue(log: CapturedLog) {
+    add_batch_to_retry_queue(vec![log]);
+}
+
+pub fn add_batch_to_retry_queue(logs: Vec<CapturedLog>) {
+    if logs.is_empty() {
+        return;
+    }
+    
     let config = RETRY_CONFIG.lock().unwrap();
     if !config.enabled {
         return;
     }
     
     let mut queue = RETRY_QUEUE.lock().unwrap();
-    if queue.len() >= config.queue_size {
-        // Queue full, drop oldest retry attempt
-        LOGS_RETRY_FAILED.fetch_add(1, Ordering::SeqCst);
-        queue.pop_front();
+    let queue_size = config.queue_size;
+    
+    for log in logs {
+        if queue.len() >= queue_size {
+            LOGS_RETRY_FAILED.fetch_add(1, Ordering::SeqCst);
+            queue.pop_front();
+        }
+        queue.push_back((log, 0));
     }
-    queue.push_back((log, 0));
 }
 
 pub fn get_retry_logs() -> Vec<CapturedLog> {
@@ -131,24 +146,19 @@ pub fn get_retry_logs() -> Vec<CapturedLog> {
     
     let mut queue = RETRY_QUEUE.lock().unwrap();
     let max_attempts = config.max_attempts;
-    let mut result = Vec::new();
-    let mut to_remove = Vec::new();
+    let mut result = Vec::with_capacity(queue.len());
+    let mut remaining = VecDeque::new();
     
-    for (i, (log, attempts)) in queue.iter_mut().enumerate() {
-        if *attempts < max_attempts {
+    while let Some((log, attempts)) = queue.pop_front() {
+        if attempts < max_attempts {
             result.push(log.clone());
-            *attempts += 1;
+            remaining.push_back((log, attempts + 1));
         } else {
             LOGS_RETRY_FAILED.fetch_add(1, Ordering::SeqCst);
-            to_remove.push(i);
         }
     }
     
-    // Remove failed retries (in reverse order to maintain indices)
-    for i in to_remove.into_iter().rev() {
-        queue.remove(i);
-    }
-    
+    *queue = remaining;
     result
 }
 
@@ -632,37 +642,45 @@ unsafe extern "C-unwind" fn emit_log_hook_func(edata: *mut pgrx::pg_sys::ErrorDa
         return;
     }
 
-    // Skip if shared memory isn't initialized yet. Between _PG_init (which
-    // installs this hook) and shmem_startup_hook (which creates the ring
-    // buffer), any log message would access uninitialized shmem and SIGSEGV.
     if !SHMEM_READY.load(Ordering::SeqCst) {
         return;
     }
 
-    // Get the message for filtering (need to extract it first)
-    let message = unsafe {
-        if (*edata).message.is_null() {
+    let level = (*edata).elevel;
+    
+    // Fast path: check level filter first (no string allocation)
+    let level_min = FILTER_CONFIG.lock().unwrap().level_min;
+    if level < level_min {
+        return;
+    }
+
+    // Check if pattern filtering is configured
+    let needs_pattern_check = {
+        let cfg = FILTER_CONFIG.lock().unwrap();
+        cfg.pattern.is_some() || cfg.pattern_exclude.is_some()
+    };
+
+    if needs_pattern_check {
+        // Only extract message if pattern filtering is enabled
+        let message = if (*edata).message.is_null() {
             String::new()
         } else {
             CStr::from_ptr((*edata).message)
                 .to_str()
                 .unwrap_or_default()
                 .to_string()
-        }
-    };
+        };
 
-    // Apply filters
-    if !should_capture_log((*edata).elevel, &message) {
-        return;
+        if !should_capture_log(level, &message) {
+            return;
+        }
     }
 
     let entry = build_shm_entry(&*edata);
 
-    // Write to shared memory ring buffer.
     let mut buf = LOG_RING_BUFFER.exclusive();
     buf.push(entry);
     
-    // Track dropped if buffer was full
     if buf.count >= buf.get_capacity() {
         LOGS_DROPPED.fetch_add(1, Ordering::SeqCst);
     }
