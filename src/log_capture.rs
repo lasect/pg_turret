@@ -1,18 +1,161 @@
 use chrono::Utc;
+use once_cell::sync::Lazy;
 use pgrx::pg_sys::{self, ErrorData};
 use pgrx::{PGRXSharedMemory, PgLwLock};
+use regex::Regex;
+use serde::Serialize;
+use std::collections::VecDeque;
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Flag indicating shared memory has been initialized and the ring buffer is safe to access.
 static SHMEM_READY: AtomicBool = AtomicBool::new(false);
 
 /// Maximum number of log entries in the shared memory ring buffer.
-const RING_BUFFER_CAPACITY: usize = 1024;
+/// This is the compile-time maximum. The actual used size is controlled by GUC.
+const RING_BUFFER_MAX_CAPACITY: usize = 65536;
+const RING_BUFFER_DEFAULT_CAPACITY: usize = 1024;
 
 /// Maximum length for string fields stored in shared memory.
 const MAX_SHORT_STR: usize = 256;
 const MAX_MSG_STR: usize = 1024;
+
+#[derive(Clone)]
+pub struct FilterConfig {
+    pub level_min: i32,
+    pub pattern: Option<String>,
+    pub pattern_exclude: Option<String>,
+}
+
+impl Default for FilterConfig {
+    fn default() -> Self {
+        Self {
+            level_min: 10,
+            pattern: None,
+            pattern_exclude: None,
+        }
+    }
+}
+
+static FILTER_CONFIG: Lazy<Mutex<FilterConfig>> = Lazy::new(|| Mutex::new(FilterConfig::default()));
+static FILTER_PATTERN: Lazy<Mutex<Option<Regex>>> = Lazy::new(|| Mutex::new(None));
+static FILTER_PATTERN_EXCLUDE: Lazy<Mutex<Option<Regex>>> = Lazy::new(|| Mutex::new(None));
+
+#[derive(Clone)]
+pub struct RetryConfig {
+    pub enabled: bool,
+    pub max_attempts: u32,
+    pub queue_size: usize,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_attempts: 3,
+            queue_size: 512,
+        }
+    }
+}
+
+static RETRY_CONFIG: Lazy<Mutex<RetryConfig>> = Lazy::new(|| Mutex::new(RetryConfig::default()));
+static RETRY_QUEUE: Lazy<Mutex<VecDeque<(CapturedLog, u32)>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
+
+pub static LOGS_CAPTURED: AtomicU64 = AtomicU64::new(0);
+pub static LOGS_DROPPED: AtomicU64 = AtomicU64::new(0);
+pub static LOGS_SENT: AtomicU64 = AtomicU64::new(0);
+pub static LOGS_RETRY_FAILED: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_filter_config(config: FilterConfig) {
+    let mut filter = FILTER_CONFIG.lock().unwrap();
+    *filter = config.clone();
+    
+    // Compile include pattern
+    let mut pattern_guard = FILTER_PATTERN.lock().unwrap();
+    *pattern_guard = config.pattern.as_ref().and_then(|p| Regex::new(p).ok());
+    
+    // Compile exclude pattern
+    let mut exclude_guard = FILTER_PATTERN_EXCLUDE.lock().unwrap();
+    *exclude_guard = config.pattern_exclude.as_ref().and_then(|p| Regex::new(p).ok());
+}
+
+pub fn set_retry_config(config: RetryConfig) {
+    let mut retry = RETRY_CONFIG.lock().unwrap();
+    *retry = config;
+}
+
+pub fn should_capture_log(level: i32, message: &str) -> bool {
+    // Check level filter
+    if level < FILTER_CONFIG.lock().unwrap().level_min {
+        return false;
+    }
+    
+    // Check include pattern
+    if let Some(ref pattern) = *FILTER_PATTERN.lock().unwrap() {
+        if !pattern.is_match(message) {
+            return false;
+        }
+    }
+    
+    // Check exclude pattern
+    if let Some(ref pattern) = *FILTER_PATTERN_EXCLUDE.lock().unwrap() {
+        if pattern.is_match(message) {
+            return false;
+        }
+    }
+    
+    true
+}
+
+pub fn add_to_retry_queue(log: CapturedLog) {
+    let config = RETRY_CONFIG.lock().unwrap();
+    if !config.enabled {
+        return;
+    }
+    
+    let mut queue = RETRY_QUEUE.lock().unwrap();
+    if queue.len() >= config.queue_size {
+        // Queue full, drop oldest retry attempt
+        LOGS_RETRY_FAILED.fetch_add(1, Ordering::SeqCst);
+        queue.pop_front();
+    }
+    queue.push_back((log, 0));
+}
+
+pub fn get_retry_logs() -> Vec<CapturedLog> {
+    let config = RETRY_CONFIG.lock().unwrap();
+    if !config.enabled {
+        return vec![];
+    }
+    
+    let mut queue = RETRY_QUEUE.lock().unwrap();
+    let max_attempts = config.max_attempts;
+    let mut result = Vec::new();
+    let mut to_remove = Vec::new();
+    
+    for (i, (log, attempts)) in queue.iter_mut().enumerate() {
+        if *attempts < max_attempts {
+            result.push(log.clone());
+            *attempts += 1;
+        } else {
+            LOGS_RETRY_FAILED.fetch_add(1, Ordering::SeqCst);
+            to_remove.push(i);
+        }
+    }
+    
+    // Remove failed retries (in reverse order to maintain indices)
+    for i in to_remove.into_iter().rev() {
+        queue.remove(i);
+    }
+    
+    result
+}
+
+pub fn clear_retry_queue() {
+    let mut queue = RETRY_QUEUE.lock().unwrap();
+    queue.clear();
+}
 
 /// A fixed-size string stored inline in shared memory.
 #[derive(Copy, Clone)]
@@ -135,6 +278,7 @@ impl ShmLogEntry {
 }
 
 /// Ring buffer for log entries in shared memory.
+/// Uses maximum capacity at compile time, but actual usage is controlled by configured size.
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct ShmLogRingBuffer {
@@ -144,8 +288,12 @@ pub struct ShmLogRingBuffer {
     read_pos: usize,
     /// Number of entries currently in the buffer.
     count: usize,
-    /// The ring buffer entries.
-    entries: [ShmLogEntry; RING_BUFFER_CAPACITY],
+    /// Number of entries dropped due to buffer overflow.
+    dropped: u64,
+    /// Configured capacity (set via GUC at runtime).
+    configured_capacity: usize,
+    /// The ring buffer entries (max capacity).
+    entries: [ShmLogEntry; RING_BUFFER_MAX_CAPACITY],
 }
 
 unsafe impl PGRXSharedMemory for ShmLogRingBuffer {}
@@ -156,24 +304,53 @@ impl Default for ShmLogRingBuffer {
             write_pos: 0,
             read_pos: 0,
             count: 0,
-            entries: [ShmLogEntry::empty(); RING_BUFFER_CAPACITY],
+            dropped: 0,
+            configured_capacity: RING_BUFFER_DEFAULT_CAPACITY,
+            entries: [ShmLogEntry::empty(); RING_BUFFER_MAX_CAPACITY],
         }
     }
 }
 
 impl ShmLogRingBuffer {
+    /// Set the configured capacity (must be called after shmem init).
+    pub fn set_capacity(&mut self, capacity: usize) {
+        let capacity = capacity.min(RING_BUFFER_MAX_CAPACITY).max(128);
+        self.configured_capacity = capacity;
+        // If current count exceeds new capacity, adjust
+        if self.count > capacity {
+            self.read_pos = (self.write_pos + capacity).wrapping_sub(self.count) % RING_BUFFER_MAX_CAPACITY;
+            self.count = capacity;
+        }
+    }
+
+    pub fn get_capacity(&self) -> usize {
+        self.configured_capacity
+    }
+
     /// Push a log entry into the ring buffer. If full, overwrites the oldest entry.
     pub fn push(&mut self, entry: ShmLogEntry) {
+        let capacity = self.configured_capacity;
         self.entries[self.write_pos] = entry;
         self.entries[self.write_pos].occupied = true;
-        self.write_pos = (self.write_pos + 1) % RING_BUFFER_CAPACITY;
+        self.write_pos = (self.write_pos + 1) % RING_BUFFER_MAX_CAPACITY;
 
-        if self.count < RING_BUFFER_CAPACITY {
+        if self.count < capacity {
             self.count += 1;
         } else {
             // Buffer full - advance read_pos (dropping oldest)
-            self.read_pos = (self.read_pos + 1) % RING_BUFFER_CAPACITY;
+            self.read_pos = (self.read_pos + 1) % RING_BUFFER_MAX_CAPACITY;
+            self.dropped += 1;
         }
+    }
+
+    /// Get the number of entries dropped due to buffer overflow.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Reset the dropped counter.
+    pub fn reset_dropped(&mut self) {
+        self.dropped = 0;
     }
 
     /// Drain all available entries from the ring buffer.
@@ -186,15 +363,17 @@ impl ShmLogRingBuffer {
             entries: &self.entries,
             pos: start,
             remaining: count,
+            capacity: RING_BUFFER_MAX_CAPACITY,
         }
     }
 }
 
 /// Iterator over drained entries. Borrows the entries array.
 pub struct ShmDrainIter<'a> {
-    entries: &'a [ShmLogEntry; RING_BUFFER_CAPACITY],
+    entries: &'a [ShmLogEntry; RING_BUFFER_MAX_CAPACITY],
     pos: usize,
     remaining: usize,
+    capacity: usize,
 }
 
 impl<'a> Iterator for ShmDrainIter<'a> {
@@ -205,7 +384,7 @@ impl<'a> Iterator for ShmDrainIter<'a> {
             return None;
         }
         let entry = self.entries[self.pos];
-        self.pos = (self.pos + 1) % RING_BUFFER_CAPACITY;
+        self.pos = (self.pos + 1) % self.capacity;
         self.remaining -= 1;
         Some(entry)
     }
@@ -220,7 +399,7 @@ pub static LOG_RING_BUFFER: PgLwLock<ShmLogRingBuffer> =
     unsafe { PgLwLock::new(c"pg_turret_log_ring") };
 
 /// Decoded log entry for use in Rust (heap-allocated strings).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CapturedLog {
     pub timestamp: String,
     pub elevel: i32,
@@ -235,6 +414,59 @@ pub struct CapturedLog {
     pub database: Option<String>,
     pub user: Option<String>,
     pub query: Option<String>,
+}
+
+impl CapturedLog {
+    pub fn level_str(&self) -> &'static str {
+        match self.elevel {
+            10..=14 => "DEBUG",
+            15 | 16 => "LOG",
+            17 => "INFO",
+            18 => "NOTICE",
+            19 => "WARNING",
+            20 => "ERROR",
+            21 => "FATAL",
+            22 => "PANIC",
+            _ => "UNKNOWN",
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct SerializableLog<'a> {
+    timestamp: &'a str,
+    level: &'a str,
+    message: &'a str,
+    detail: &'a Option<String>,
+    hint: &'a Option<String>,
+    context: &'a Option<String>,
+    sqlerrcode: i32,
+    filename: &'a Option<String>,
+    lineno: i32,
+    funcname: &'a Option<String>,
+    database: &'a Option<String>,
+    user: &'a Option<String>,
+    query: &'a Option<String>,
+}
+
+impl<'a> From<&'a CapturedLog> for SerializableLog<'a> {
+    fn from(log: &'a CapturedLog) -> Self {
+        Self {
+            timestamp: &log.timestamp,
+            level: log.level_str(),
+            message: &log.message,
+            detail: &log.detail,
+            hint: &log.hint,
+            context: &log.context,
+            sqlerrcode: log.sqlerrcode,
+            filename: &log.filename,
+            lineno: log.lineno,
+            funcname: &log.funcname,
+            database: &log.database,
+            user: &log.user,
+            query: &log.query,
+        }
+    }
 }
 
 impl From<&ShmLogEntry> for CapturedLog {
@@ -261,12 +493,45 @@ impl From<&ShmLogEntry> for CapturedLog {
 /// Called by the background worker.
 pub fn consume_logs() -> Vec<CapturedLog> {
     let mut buf = LOG_RING_BUFFER.exclusive();
-    buf.drain().map(|e| CapturedLog::from(&e)).collect()
+    let drained: Vec<CapturedLog> = buf.drain().map(|e| CapturedLog::from(&e)).collect();
+    LOGS_CAPTURED.fetch_add(drained.len() as u64, Ordering::SeqCst);
+    drained
+}
+
+/// Set the ring buffer capacity (called after GUC is read).
+pub fn set_buffer_capacity(capacity: usize) {
+    let mut buf = LOG_RING_BUFFER.exclusive();
+    buf.set_capacity(capacity);
 }
 
 /// Get count of pending logs (for the SQL function).
 pub fn get_pending_count() -> usize {
     LOG_RING_BUFFER.share().count
+}
+
+/// Get ring buffer capacity.
+pub fn get_buffer_capacity() -> usize {
+    LOG_RING_BUFFER.share().get_capacity()
+}
+
+/// Get total logs captured (cumulative).
+pub fn get_logs_captured() -> u64 {
+    LOGS_CAPTURED.load(Ordering::SeqCst)
+}
+
+/// Get total logs dropped (cumulative).
+pub fn get_logs_dropped() -> u64 {
+    LOGS_DROPPED.load(Ordering::SeqCst)
+}
+
+/// Get total logs sent successfully (cumulative).
+pub fn get_logs_sent() -> u64 {
+    LOGS_SENT.load(Ordering::SeqCst)
+}
+
+/// Get total retry failures (cumulative).
+pub fn get_logs_retry_failed() -> u64 {
+    LOGS_RETRY_FAILED.load(Ordering::SeqCst)
 }
 
 fn c_str_to_option(ptr: *const std::ffi::c_char) -> Option<String> {
@@ -374,11 +639,33 @@ unsafe extern "C-unwind" fn emit_log_hook_func(edata: *mut pgrx::pg_sys::ErrorDa
         return;
     }
 
+    // Get the message for filtering (need to extract it first)
+    let message = unsafe {
+        if (*edata).message.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr((*edata).message)
+                .to_str()
+                .unwrap_or_default()
+                .to_string()
+        }
+    };
+
+    // Apply filters
+    if !should_capture_log((*edata).elevel, &message) {
+        return;
+    }
+
     let entry = build_shm_entry(&*edata);
 
     // Write to shared memory ring buffer.
     let mut buf = LOG_RING_BUFFER.exclusive();
     buf.push(entry);
+    
+    // Track dropped if buffer was full
+    if buf.count >= buf.get_capacity() {
+        LOGS_DROPPED.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 pub fn set_hook() {
