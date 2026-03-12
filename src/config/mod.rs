@@ -2,7 +2,8 @@ use std::sync::{LazyLock, Mutex};
 
 pub mod http;
 
-static ENABLED_STREAMS: LazyLock<Mutex<StreamFlags>> = LazyLock::new(|| Mutex::new(StreamFlags::default()));
+static ENABLED_STREAMS: LazyLock<Mutex<StreamFlags>> =
+    LazyLock::new(|| Mutex::new(StreamFlags::default()));
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamFlags {
@@ -123,7 +124,7 @@ pub fn reload_config() {
     #[cfg(feature = "std")]
     {
         set_stream_enabled(StreamType::Http, crate::HTTP_ENABLED.get());
-        
+
         // Other streams will be added here as they are implemented
     }
 }

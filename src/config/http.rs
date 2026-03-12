@@ -25,7 +25,8 @@ impl Default for HttpConfig {
     }
 }
 
-static HTTP_CONFIG: LazyLock<Mutex<HttpConfig>> = LazyLock::new(|| Mutex::new(HttpConfig::default()));
+static HTTP_CONFIG: LazyLock<Mutex<HttpConfig>> =
+    LazyLock::new(|| Mutex::new(HttpConfig::default()));
 
 pub fn set_http_config(config: HttpConfig) {
     if let Ok(mut cfg) = HTTP_CONFIG.lock() {
@@ -109,7 +110,8 @@ impl Adapter for HttpAdapter {
                     request = request.header("Authorization", format!("Bearer {}", api_key));
                 }
 
-                let payload: Vec<serde_json::Value> = batch.iter().map(|log| log.to_json()).collect();
+                let payload: Vec<serde_json::Value> =
+                    batch.iter().map(|log| log.to_json()).collect();
 
                 let body = serde_json::to_vec(&payload).map_err(|e| AdapterError {
                     message: format!("Failed to serialize logs: {}", e),
@@ -168,4 +170,3 @@ impl CapturedLog {
         })
     }
 }
-
