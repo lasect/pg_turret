@@ -98,6 +98,17 @@ impl KafkaAdapter {
     ) -> Result<(), AdapterError> {
         let mut last_error = None;
 
+        // Exponential backoff parameters (in milliseconds)
+        // These values are chosen to:
+        // - give topic auto-creation some time to complete
+        // - avoid long blocking sleeps in the background worker
+        // - cap individual delays to keep the worker responsive
+        const UNKNOWN_TOPIC_BASE_DELAY_MS: u64 = 500;
+        const UNKNOWN_TOPIC_MAX_DELAY_MS: u64 = 2_000;
+        const OTHER_ERROR_BASE_DELAY_MS: u64 = 100;
+        const OTHER_ERROR_MAX_DELAY_MS: u64 = 1_000;
+        const BACKOFF_FACTOR: u32 = 2;
+
         for attempt in 0..=max_retries {
             match producer.send(record) {
                 Ok(()) => return Ok(()),
@@ -106,12 +117,14 @@ impl KafkaAdapter {
                     last_error = Some(e);
 
                     if is_unknown_topic && attempt < max_retries {
-                        // UnknownTopicOrPartition - wait and retry
+                        // UnknownTopicOrPartition - exponential backoff with cap
                         // This gives time for:
                         // 1. Topic auto-creation to complete
                         // 2. Metadata to propagate across brokers
-                        // Use longer delays for topic creation (1s, 2s, 3s, 4s...)
-                        let delay = Duration::from_millis(1000 * (attempt as u64 + 1));
+                        let backoff = UNKNOWN_TOPIC_BASE_DELAY_MS
+                            .saturating_mul(BACKOFF_FACTOR.saturating_pow(attempt) as u64)
+                            .min(UNKNOWN_TOPIC_MAX_DELAY_MS);
+                        let delay = Duration::from_millis(backoff);
                         thread::sleep(delay);
 
                         // Recreate producer to force metadata refresh
@@ -130,8 +143,11 @@ impl KafkaAdapter {
                             }
                         }
                     } else if attempt < max_retries {
-                        // Other transient error - just wait and retry
-                        let delay = Duration::from_millis(200 * (attempt as u64 + 1));
+                        // Other transient error - exponential backoff with smaller cap
+                        let backoff = OTHER_ERROR_BASE_DELAY_MS
+                            .saturating_mul(BACKOFF_FACTOR.saturating_pow(attempt) as u64)
+                            .min(OTHER_ERROR_MAX_DELAY_MS);
+                        let delay = Duration::from_millis(backoff);
                         thread::sleep(delay);
                         continue;
                     }
