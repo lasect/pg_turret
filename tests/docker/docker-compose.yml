@@ -1,39 +1,26 @@
 services:
   db:
+    build: .
     image: pg_turret_db
+    container_name: pg_turret_db_test
+    network_mode: host
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
       POSTGRES_DB: postgres
-    ports:
-      - "5435:5432"
+    # ports are ignored in network_mode: host
     command: >
       postgres
+      -p 5434
       -c shared_preload_libraries=pg_turret
       -c pg_turret.http.enabled=true
-      -c pg_turret.http.endpoint=http://mock-server:8080/ingest
+      -c pg_turret.http.endpoint=http://localhost:8080/ingest
       -c pg_turret.poll_interval_s=1
       -c log_min_messages=info
       -c client_min_messages=info
       -c log_statement=all
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 5434 -U postgres"]
       interval: 2s
       timeout: 5s
       retries: 10
-    depends_on:
-      mock-server:
-        condition: service_healthy
-
-  mock-server:
-    image: mendhak/http-https-echo:39
-    environment:
-      - LOG_IGNORE_PATH=/ping
-      - DISABLE_REQUEST_LOGS=true
-    ports:
-      - "8080:8080"
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/ping"]
-      interval: 2s
-      timeout: 5s
-      retries: 5
