@@ -1,0 +1,36 @@
+# Multi-stage build: build extension inside container with matching glibc
+FROM debian:sid AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    cmake \
+    rustc \
+    cargo \
+    libclang-dev \
+    clang \
+    postgresql-server-dev-18 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+COPY Cargo.toml ./
+COPY Cargo.lock ./
+COPY src/ ./src/
+COPY pg_turret.control ./
+
+RUN cargo build --release --no-default-features --features "std"
+
+# Final stage - use same debian sid
+FROM debian:sid
+
+RUN apt-get update && apt-get install -y \
+    postgresql-18 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/libpg_turret.so /usr/lib/postgresql/18/lib/
+COPY --from=builder /build/target/release/pg_turret.so /usr/lib/postgresql/18/lib/
+
+COPY pg_turret.control /usr/share/postgresql/18/extension/
+RUN echo "shared_preload_libraries = 'pg_turret'" >> /etc/postgresql/18/main/postgresql.conf

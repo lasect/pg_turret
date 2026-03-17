@@ -12,10 +12,12 @@ pub mod log_capture;
 pub mod metrics;
 
 use config::http::HttpAdapter;
+use config::kafka::KafkaAdapter;
 use config::Adapter;
 use log_capture::LOG_RING_BUFFER;
 
 static HTTP_ADAPTER: LazyLock<HttpAdapter> = LazyLock::new(HttpAdapter::new);
+static KAFKA_ADAPTER: LazyLock<KafkaAdapter> = LazyLock::new(KafkaAdapter::new);
 
 pub static HTTP_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(false);
 pub static HTTP_ENDPOINT: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
@@ -23,6 +25,16 @@ pub static HTTP_API_KEY: GucSetting<Option<CString>> = GucSetting::<Option<CStri
 pub static HTTP_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(5000);
 pub static HTTP_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(100);
 pub static HTTP_COMPRESSION: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+pub static KAFKA_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub static KAFKA_BROKERS: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+pub static KAFKA_TOPIC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+pub static KAFKA_API_KEY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+pub static KAFKA_API_SECRET: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+pub static KAFKA_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(5000);
+pub static KAFKA_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(100);
+
+
 
 pub static POLL_INTERVAL_S: GucSetting<i32> = GucSetting::<i32>::new(10);
 pub static RING_BUFFER_SIZE: GucSetting<i32> = GucSetting::<i32>::new(1024);
@@ -56,38 +68,50 @@ fn register_guc() {
         GucFlags::default(),
     );
 
-    GucRegistry::define_string_guc(
-        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.http.api_key\0") },
-        unsafe { CStr::from_bytes_with_nul_unchecked(b"HTTP API key\0") },
-        unsafe {
-            CStr::from_bytes_with_nul_unchecked(b"API key for authentication with HTTP endpoint\0")
-        },
-        &HTTP_API_KEY,
-        GucContext::Sighup,
-        GucFlags::default(),
-    );
+     GucRegistry::define_string_guc(
+         unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.http.api_key\0") },
+         unsafe { CStr::from_bytes_with_nul_unchecked(b"HTTP API key\0") },
+         unsafe {
+             CStr::from_bytes_with_nul_unchecked(b"API key for authentication with HTTP endpoint\0")
+         },
+         &HTTP_API_KEY,
+         GucContext::Sighup,
+         GucFlags::default(),
+     );
 
-    GucRegistry::define_int_guc(
-        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.http.timeout_ms\0") },
-        unsafe { CStr::from_bytes_with_nul_unchecked(b"HTTP request timeout in milliseconds\0") },
-        unsafe { CStr::from_bytes_with_nul_unchecked(b"Timeout for HTTP requests\0") },
-        &HTTP_TIMEOUT_MS,
-        100,
-        60000,
-        GucContext::Sighup,
-        GucFlags::default(),
-    );
+     GucRegistry::define_int_guc(
+         unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.http.timeout_ms\0") },
+         unsafe { CStr::from_bytes_with_nul_unchecked(b"HTTP request timeout in milliseconds\0") },
+         unsafe { CStr::from_bytes_with_nul_unchecked(b"Timeout for HTTP requests\0") },
+         &HTTP_TIMEOUT_MS,
+         100,
+         60000,
+         GucContext::Sighup,
+         GucFlags::default(),
+     );
 
-    GucRegistry::define_int_guc(
-        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.http.batch_size\0") },
-        unsafe { CStr::from_bytes_with_nul_unchecked(b"HTTP batch size\0") },
-        unsafe { CStr::from_bytes_with_nul_unchecked(b"Number of logs to batch before sending\0") },
-        &HTTP_BATCH_SIZE,
-        1,
-        1000,
-        GucContext::Sighup,
-        GucFlags::default(),
-    );
+     GucRegistry::define_int_guc(
+         unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.http.batch_size\0") },
+         unsafe { CStr::from_bytes_with_nul_unchecked(b"HTTP batch size\0") },
+         unsafe { CStr::from_bytes_with_nul_unchecked(b"Number of logs to batch before sending\0") },
+         &HTTP_BATCH_SIZE,
+         1,
+         1000,
+         GucContext::Sighup,
+         GucFlags::default(),
+     );
+
+     GucRegistry::define_bool_guc(
+         unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.http.compression\0") },
+         unsafe { CStr::from_bytes_with_nul_unchecked(b"Enable gzip compression\0") },
+         unsafe {
+             CStr::from_bytes_with_nul_unchecked(b"Compress HTTP request bodies with gzip\0")
+         },
+         &HTTP_COMPRESSION,
+         GucContext::Sighup,
+         GucFlags::default(),
+     );
+
 
     GucRegistry::define_int_guc(
         unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.poll_interval_s\0") },
@@ -130,17 +154,6 @@ fn register_guc() {
         &NUM_WORKERS,
         1,
         8,
-        GucContext::Sighup,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_bool_guc(
-        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.http.compression\0") },
-        unsafe { CStr::from_bytes_with_nul_unchecked(b"Enable gzip compression\0") },
-        unsafe {
-            CStr::from_bytes_with_nul_unchecked(b"Compress HTTP request bodies with gzip\0")
-        },
-        &HTTP_COMPRESSION,
         GucContext::Sighup,
         GucFlags::default(),
     );
@@ -228,6 +241,79 @@ fn register_guc() {
         GucContext::Sighup,
         GucFlags::default(),
     );
+
+    GucRegistry::define_bool_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.kafka.enabled\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Enable Kafka log export\0") },
+        unsafe {
+            CStr::from_bytes_with_nul_unchecked(b"Set to true to enable exporting logs via Kafka\0")
+        },
+        &KAFKA_ENABLED,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.kafka.brokers\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Kafka broker list\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Comma-separated list of Kafka brokers\0") },
+        &KAFKA_BROKERS,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.kafka.topic\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Kafka topic\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Kafka topic to publish logs to\0") },
+        &KAFKA_TOPIC,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.kafka.api_key\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Kafka API key\0") },
+        unsafe {
+            CStr::from_bytes_with_nul_unchecked(b"API key for authentication with Kafka\0")
+        },
+        &KAFKA_API_KEY,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.kafka.api_secret\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Kafka API secret\0") },
+        unsafe {
+            CStr::from_bytes_with_nul_unchecked(b"API secret for authentication with Kafka\0")
+        },
+        &KAFKA_API_SECRET,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.kafka.timeout_ms\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Kafka request timeout in milliseconds\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Timeout for Kafka requests\0") },
+        &KAFKA_TIMEOUT_MS,
+        100,
+        60000,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.kafka.batch_size\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Kafka batch size\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Number of logs to batch before sending\0") },
+        &KAFKA_BATCH_SIZE,
+        1,
+        1000,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
 }
 
 ::pgrx::pg_module_magic!();
@@ -293,40 +379,60 @@ unsafe extern "C-unwind" fn turret_shmem_startup() {
     log_capture::set_hook();
 }
 
-fn sync_worker_config() {
-    config::http::HttpAdapter::set_enabled(HTTP_ENABLED.get());
-    config::http::set_http_config(config::http::HttpConfig {
-        endpoint: HTTP_ENDPOINT
-            .get()
-            .and_then(|cs| cs.to_str().ok().map(|s| s.to_string()))
-            .unwrap_or_default(),
-        api_key: HTTP_API_KEY
-            .get()
-            .and_then(|cs| cs.to_str().ok().map(|s| s.to_string())),
-        timeout_ms: HTTP_TIMEOUT_MS.get() as u64,
-        batch_size: HTTP_BATCH_SIZE.get() as usize,
-        compression: HTTP_COMPRESSION.get(),
-    });
+    fn sync_worker_config() {
+        config::http::HttpAdapter::set_enabled(HTTP_ENABLED.get());
+        config::http::set_http_config(config::http::HttpConfig {
+            endpoint: HTTP_ENDPOINT
+                .get()
+                .and_then(|cs| cs.to_str().ok().map(|s| s.to_string()))
+                .unwrap_or_default(),
+            api_key: HTTP_API_KEY
+                .get()
+                .and_then(|cs| cs.to_str().ok().map(|s| s.to_string())),
+            timeout_ms: HTTP_TIMEOUT_MS.get() as u64,
+            batch_size: HTTP_BATCH_SIZE.get() as usize,
+            compression: HTTP_COMPRESSION.get(),
+        });
 
-    log_capture::set_filter_config(log_capture::FilterConfig {
-        level_min: LOG_LEVEL_MIN.get(),
-        pattern: LOG_PATTERN
-            .get()
-            .and_then(|cs| cs.to_str().ok().map(|s| s.to_string())),
-        pattern_exclude: LOG_PATTERN_EXCLUDE
-            .get()
-            .and_then(|cs| cs.to_str().ok().map(|s| s.to_string())),
-    });
+        config::kafka::KafkaAdapter::set_enabled(KAFKA_ENABLED.get());
+        config::kafka::set_kafka_config(config::kafka::KafkaConfig {
+            brokers: KAFKA_BROKERS
+                .get()
+                .and_then(|cs| cs.to_str().ok().map(|s| s.to_string()))
+                .unwrap_or_default(),
+            topic: KAFKA_TOPIC
+                .get()
+                .and_then(|cs| cs.to_str().ok().map(|s| s.to_string()))
+                .unwrap_or_default(),
+            api_key: KAFKA_API_KEY
+                .get()
+                .and_then(|cs| cs.to_str().ok().map(|s| s.to_string())),
+            api_secret: KAFKA_API_SECRET
+                .get()
+                .and_then(|cs| cs.to_str().ok().map(|s| s.to_string())),
+            timeout_ms: KAFKA_TIMEOUT_MS.get() as u64,
+            batch_size: KAFKA_BATCH_SIZE.get() as usize,
+        });
 
-    log_capture::set_retry_config(log_capture::RetryConfig {
-        enabled: RETRY_ENABLED.get(),
-        max_attempts: RETRY_MAX_ATTEMPTS.get() as u32,
-        queue_size: RETRY_QUEUE_SIZE.get() as usize,
-    });
+        log_capture::set_filter_config(log_capture::FilterConfig {
+            level_min: LOG_LEVEL_MIN.get(),
+            pattern: LOG_PATTERN
+                .get()
+                .and_then(|cs| cs.to_str().ok().map(|s| s.to_string())),
+            pattern_exclude: LOG_PATTERN_EXCLUDE
+                .get()
+                .and_then(|cs| cs.to_str().ok().map(|s| s.to_string())),
+        });
 
-    // Update ring buffer capacity
-    log_capture::set_buffer_capacity(RING_BUFFER_SIZE.get() as usize);
-}
+        log_capture::set_retry_config(log_capture::RetryConfig {
+            enabled: RETRY_ENABLED.get(),
+            max_attempts: RETRY_MAX_ATTEMPTS.get() as u32,
+            queue_size: RETRY_QUEUE_SIZE.get() as usize,
+        });
+
+        // Update ring buffer capacity
+        log_capture::set_buffer_capacity(RING_BUFFER_SIZE.get() as usize);
+    }
 
 #[pg_guard]
 #[unsafe(no_mangle)]
@@ -348,9 +454,18 @@ pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
             sync_worker_config();
         }
 
+        // Get list of enabled adapters
+        let adapters: Vec<&dyn Adapter> = vec![
+            &*HTTP_ADAPTER as &dyn Adapter,
+            &*KAFKA_ADAPTER as &dyn Adapter,
+        ]
+        .into_iter()
+        .filter(|a: &&dyn Adapter| a.is_enabled())
+        .collect();
+
         // First, try to send any logs pending in retry queue
         let retry_data = log_capture::get_retry_logs();
-        if !retry_data.is_empty() && HTTP_ADAPTER.is_enabled() {
+        if !retry_data.is_empty() {
             let mut logs = Vec::with_capacity(retry_data.len());
             let mut attempts = Vec::with_capacity(retry_data.len());
             for (log, attempt) in retry_data {
@@ -358,8 +473,15 @@ pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
                 attempts.push(attempt);
             }
 
-            if let Err(e) = HTTP_ADAPTER.send(&logs) {
-                pgrx::log!("pg_turret: failed to send retry logs: {}", e.message);
+            let mut all_succeeded = true;
+            for adapter in &adapters {
+                if let Err(e) = adapter.send(&logs) {
+                    pgrx::log!("pg_turret: failed to send retry logs to {}: {}", adapter.name(), e.message);
+                    all_succeeded = false;
+                }
+            }
+
+            if !all_succeeded {
                 // Re-add with incremented attempts
                 for (log, attempt) in logs.into_iter().zip(attempts) {
                     log_capture::add_batch_to_retry_queue(vec![log], attempt + 1);
@@ -372,13 +494,18 @@ pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
         // Then consume new logs from ring buffer
         let logs = log_capture::consume_logs();
         if !logs.is_empty() {
-            if HTTP_ADAPTER.is_enabled() {
-                if let Err(e) = HTTP_ADAPTER.send(&logs) {
-                    pgrx::log!("pg_turret: failed to send logs: {}", e.message);
-                    log_capture::add_batch_to_retry_queue(logs, 1);
-                } else {
-                    log_capture::LOGS_SENT.fetch_add(logs.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            let mut all_succeeded = true;
+            for adapter in &adapters {
+                if let Err(e) = adapter.send(&logs) {
+                    pgrx::log!("pg_turret: failed to send logs to {}: {}", adapter.name(), e.message);
+                    all_succeeded = false;
                 }
+            }
+
+            if !all_succeeded {
+                log_capture::add_batch_to_retry_queue(logs, 1);
+            } else {
+                log_capture::LOGS_SENT.fetch_add(logs.len() as u64, std::sync::atomic::Ordering::SeqCst);
             }
         }
     }

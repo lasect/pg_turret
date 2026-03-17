@@ -1,6 +1,7 @@
 use std::sync::{LazyLock, Mutex};
 
 pub mod http;
+pub mod kafka;
 
 static ENABLED_STREAMS: LazyLock<Mutex<StreamFlags>> =
     LazyLock::new(|| Mutex::new(StreamFlags::default()));
@@ -11,8 +12,8 @@ pub struct StreamFlags {
     pub sentry: bool,
     pub axiom: bool,
     pub datadog: bool,
-    pub websockets: bool,
     pub s3: bool,
+    pub kafka: bool,
 }
 
 impl StreamFlags {
@@ -22,8 +23,8 @@ impl StreamFlags {
             StreamType::Sentry => self.sentry,
             StreamType::Axiom => self.axiom,
             StreamType::Datadog => self.datadog,
-            StreamType::WebSockets => self.websockets,
             StreamType::S3 => self.s3,
+            StreamType::Kafka => self.kafka,
         }
     }
 }
@@ -34,8 +35,8 @@ pub enum StreamType {
     Sentry,
     Axiom,
     Datadog,
-    WebSockets,
     S3,
+    Kafka,
 }
 
 impl StreamType {
@@ -45,8 +46,8 @@ impl StreamType {
             "sentry" => Some(StreamType::Sentry),
             "axiom" => Some(StreamType::Axiom),
             "datadog" => Some(StreamType::Datadog),
-            "websockets" | "ws" => Some(StreamType::WebSockets),
             "s3" => Some(StreamType::S3),
+            "kafka" => Some(StreamType::Kafka),
             _ => None,
         }
     }
@@ -81,8 +82,8 @@ pub fn set_stream_enabled(stream: StreamType, enabled: bool) {
         StreamType::Sentry => flags.sentry = enabled,
         StreamType::Axiom => flags.axiom = enabled,
         StreamType::Datadog => flags.datadog = enabled,
-        StreamType::WebSockets => flags.websockets = enabled,
         StreamType::S3 => flags.s3 = enabled,
+        StreamType::Kafka => flags.kafka = enabled,
     }
 }
 
@@ -110,11 +111,11 @@ pub fn get_enabled_streams() -> Vec<StreamType> {
     if flags.datadog {
         enabled.push(StreamType::Datadog);
     }
-    if flags.websockets {
-        enabled.push(StreamType::WebSockets);
-    }
     if flags.s3 {
         enabled.push(StreamType::S3);
+    }
+    if flags.kafka {
+        enabled.push(StreamType::Kafka);
     }
     enabled
 }
@@ -123,6 +124,7 @@ pub fn reload_config() {
     #[cfg(feature = "std")]
     {
         set_stream_enabled(StreamType::Http, crate::HTTP_ENABLED.get());
+        set_stream_enabled(StreamType::Kafka, crate::KAFKA_ENABLED.get());
 
         // Other streams will be added here as they are implemented
     }
