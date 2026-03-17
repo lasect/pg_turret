@@ -88,6 +88,24 @@ shared_preload_libraries = 'pg_turret'
 
 `pg_turret` supports multiple output destinations. Each adapter can be enabled and configured independently.
 
+### Kafka Adapter
+
+Exports logs to a Kafka topic as JSON batches.
+
+**Configuration:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `pg_turret.kafka.enabled` | `bool` | `false` | Enable/disable Kafka export. |
+| `pg_turret.kafka.brokers` | `string` | `''` | Comma-separated list of Kafka brokers (e.g., `kafka-1:9092,kafka-2:9092`). |
+| `pg_turret.kafka.topic` | `string` | `''` | Kafka topic to publish logs to. |
+| `pg_turret.kafka.api_key` | `string` | `''` | API key for Kafka authentication (if required by your cluster). |
+| `pg_turret.kafka.api_secret` | `string` | `''` | API secret for Kafka authentication (if required by your cluster). |
+| `pg_turret.kafka.timeout_ms` | `int` | `5000` | Producer request timeout in milliseconds (100-60000). |
+| `pg_turret.kafka.batch_size` | `int` | `100` | Maximum number of log events per Kafka message (1-1000). |
+
+Logs are serialized as an array of JSON objects (same structure as the [Log Format](#log-format) section) and sent to the configured topic in batches. The adapter includes retry logic with exponential backoff for transient errors such as `UnknownTopicOrPartition` to tolerate topic auto-creation and temporary broker issues without blocking PostgreSQL.
+
 ### HTTP Adapter
 
 Exports logs to any HTTP(S) endpoint.
