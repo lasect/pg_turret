@@ -122,7 +122,28 @@ Exports logs to any HTTP(S) endpoint.
 | `pg_turret.http.compression` | `bool` | `false` | Enable gzip compression for request bodies. |
 
 ### Other Adapters (Coming Soon)
-- **Sentry**: Native integration for error tracking.
+### Sentry Adapter
+
+Exports selected PostgreSQL logs to Sentry for error tracking and incident investigation.
+
+**Configuration:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `pg_turret.sentry.enabled` | `bool` | `false` | Enable/disable Sentry export. |
+| `pg_turret.sentry.dsn` | `string` | `''` | Sentry DSN to send events to. |
+| `pg_turret.sentry.environment` | `string` | `NULL` | Optional Sentry environment (e.g. `production`). |
+| `pg_turret.sentry.release` | `string` | `NULL` | Optional Sentry release identifier (e.g. `pg_turret@1.0.0`). |
+| `pg_turret.sentry.server_name` | `string` | `NULL` | Optional logical server name (e.g. `db-prod-1`). |
+| `pg_turret.sentry.sample_rate` | `int` | `100` | Client-side sample rate as percentage (0–100). |
+| `pg_turret.sentry.min_level` | `int` | `20` | Minimum PostgreSQL log level (10–22) to forward (default `ERROR` and above). |
+| `pg_turret.sentry.include_sql` | `bool` | `false` | Include SQL text in Sentry events when available. |
+| `pg_turret.sentry.send_default_pii` | `bool` | `false` | Whether Sentry can send default PII fields. |
+| `pg_turret.sentry.max_events_per_sec` | `int` | `100` | Per-worker cap on Sentry events per second. |
+
+Only logs at or above `pg_turret.sentry.min_level` are considered, and a per-worker token bucket (`pg_turret.sentry.max_events_per_sec`) plus the Sentry `sample_rate` protect the database from overload and Sentry from high-volume firehoses. By default, SQL text and PII are not sent; enable `pg_turret.sentry.include_sql` and `pg_turret.sentry.send_default_pii` explicitly if your data policies permit it.
+
+### Other Adapters (Coming Soon)
 - **Axiom**: High-performance log storage.
 - **Datadog**: Direct ingestion to Datadog logs.
 - **S3**: Archive logs to S3-compatible buckets.

@@ -2,6 +2,7 @@ use std::sync::{LazyLock, Mutex};
 
 pub mod http;
 pub mod kafka;
+pub mod sentry;
 
 static ENABLED_STREAMS: LazyLock<Mutex<StreamFlags>> =
     LazyLock::new(|| Mutex::new(StreamFlags::default()));
@@ -125,6 +126,7 @@ pub fn reload_config() {
     {
         set_stream_enabled(StreamType::Http, crate::HTTP_ENABLED.get());
         set_stream_enabled(StreamType::Kafka, crate::KAFKA_ENABLED.get());
+        set_stream_enabled(StreamType::Sentry, crate::SENTRY_ENABLED.get());
 
         // Other streams will be added here as they are implemented
     }

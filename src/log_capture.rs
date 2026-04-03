@@ -12,6 +12,13 @@ use std::sync::Mutex;
 /// Flag indicating shared memory has been initialized and the ring buffer is safe to access.
 static SHMEM_READY: AtomicBool = AtomicBool::new(false);
 
+/// Flag to temporarily suppress the log hook (prevents recursive logging during Sentry sends).
+static HOOK_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+
+pub fn suppress_hook(suppress: bool) {
+    HOOK_SUPPRESSED.store(suppress, Ordering::SeqCst);
+}
+
 /// Maximum number of log entries in the shared memory ring buffer.
 /// This is the compile-time maximum. The actual used size is controlled by GUC.
 const RING_BUFFER_MAX_CAPACITY: usize = 1024;
@@ -595,6 +602,10 @@ pub fn mark_shmem_ready() {
 
 unsafe extern "C-unwind" fn emit_log_hook_func(edata: *mut pgrx::pg_sys::ErrorData) {
     if edata.is_null() {
+        return;
+    }
+
+    if HOOK_SUPPRESSED.load(Ordering::SeqCst) {
         return;
     }
 
