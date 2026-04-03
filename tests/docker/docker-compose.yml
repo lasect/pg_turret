@@ -1,6 +1,8 @@
 services:
   db:
-    build: .
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile
     image: pg_turret_db
     container_name: pg_turret_db_test
     network_mode: host
@@ -13,8 +15,10 @@ services:
       postgres
       -p 5434
       -c shared_preload_libraries=pg_turret
-      -c pg_turret.http.enabled=true
-      -c pg_turret.http.endpoint=http://localhost:8080/ingest
+      -c pg_turret.sentry.enabled=true
+      -c pg_turret.sentry.dsn=https://258d952e170f865f3bdfd07a5e6738aa@o4511061639692288.ingest.us.sentry.io/4511061642510336
+      -c pg_turret.sentry.environment=testing
+      -c pg_turret.sentry.min_level=15
       -c pg_turret.poll_interval_s=1
       -c log_min_messages=info
       -c client_min_messages=info

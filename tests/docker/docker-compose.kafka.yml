@@ -31,7 +31,9 @@ services:
       start_period: 30s
 
   db:
-    build: .
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile
     image: pg_turret_db
     container_name: pg_turret_db_test
     ports:

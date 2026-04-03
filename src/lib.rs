@@ -13,12 +13,13 @@ pub mod metrics;
 
 use config::http::HttpAdapter;
 use config::kafka::KafkaAdapter;
+use config::sentry::SentryAdapter;
 use config::Adapter;
 use log_capture::LOG_RING_BUFFER;
 
 static HTTP_ADAPTER: LazyLock<HttpAdapter> = LazyLock::new(HttpAdapter::new);
 static KAFKA_ADAPTER: LazyLock<KafkaAdapter> = LazyLock::new(KafkaAdapter::new);
-
+static SENTRY_ADAPTER: LazyLock<SentryAdapter> = LazyLock::new(SentryAdapter::new);
 pub static HTTP_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(false);
 pub static HTTP_ENDPOINT: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 pub static HTTP_API_KEY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
@@ -33,6 +34,19 @@ pub static KAFKA_API_KEY: GucSetting<Option<CString>> = GucSetting::<Option<CStr
 pub static KAFKA_API_SECRET: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 pub static KAFKA_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(5000);
 pub static KAFKA_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(100);
+
+pub static SENTRY_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub static SENTRY_DSN: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+pub static SENTRY_ENVIRONMENT: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+pub static SENTRY_RELEASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+pub static SENTRY_SERVER_NAME: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+pub static SENTRY_SAMPLE_RATE: GucSetting<i32> = GucSetting::<i32>::new(100);
+pub static SENTRY_MIN_LEVEL: GucSetting<i32> = GucSetting::<i32>::new(20);
+pub static SENTRY_INCLUDE_SQL: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub static SENTRY_SEND_DEFAULT_PII: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub static SENTRY_MAX_EVENTS_PER_SEC: GucSetting<i32> = GucSetting::<i32>::new(100);
 
 
 
@@ -314,6 +328,146 @@ fn register_guc() {
         GucContext::Sighup,
         GucFlags::default(),
     );
+
+    GucRegistry::define_bool_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.sentry.enabled\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Enable Sentry log export\0") },
+        unsafe {
+            CStr::from_bytes_with_nul_unchecked(
+                b"Set to true to enable exporting logs to Sentry\0",
+            )
+        },
+        &SENTRY_ENABLED,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.sentry.dsn\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Sentry DSN\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Sentry DSN for log export\0") },
+        &SENTRY_DSN,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.sentry.environment\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Sentry environment\0") },
+        unsafe {
+            CStr::from_bytes_with_nul_unchecked(
+                b"Sentry environment (e.g. production, staging)\0",
+            )
+        },
+        &SENTRY_ENVIRONMENT,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.sentry.release\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Sentry release\0") },
+        unsafe {
+            CStr::from_bytes_with_nul_unchecked(
+                b"Sentry release identifier (e.g. pg_turret@1.0.0)\0",
+            )
+        },
+        &SENTRY_RELEASE,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.sentry.server_name\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Sentry server name\0") },
+        unsafe {
+            CStr::from_bytes_with_nul_unchecked(
+                b"Sentry server name (e.g. db-prod-1)\0",
+            )
+        },
+        &SENTRY_SERVER_NAME,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.sentry.sample_rate\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Sentry sample rate\0") },
+        unsafe {
+            CStr::from_bytes_with_nul_unchecked(
+                b"Client-side sample rate for Sentry events as percentage (0-100)\0",
+            )
+        },
+        &SENTRY_SAMPLE_RATE,
+        0,
+        100,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.sentry.min_level\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Minimum log level for Sentry\0") },
+        unsafe {
+            CStr::from_bytes_with_nul_unchecked(
+                b"Minimum PostgreSQL log level (10-22) to forward to Sentry\0",
+            )
+        },
+        &SENTRY_MIN_LEVEL,
+        10,
+        22,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.sentry.include_sql\0") },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Include SQL text in Sentry events\0") },
+        unsafe {
+            CStr::from_bytes_with_nul_unchecked(
+                b"Include SQL query text in Sentry events when available\0",
+            )
+        },
+        &SENTRY_INCLUDE_SQL,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        unsafe {
+            CStr::from_bytes_with_nul_unchecked(
+                b"pg_turret.sentry.send_default_pii\0",
+            )
+        },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Sentry send_default_pii\0") },
+        unsafe {
+            CStr::from_bytes_with_nul_unchecked(
+                b"Whether Sentry should send default PII fields\0",
+            )
+        },
+        &SENTRY_SEND_DEFAULT_PII,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe {
+            CStr::from_bytes_with_nul_unchecked(
+                b"pg_turret.sentry.max_events_per_sec\0",
+            )
+        },
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"Max Sentry events per second\0") },
+        unsafe {
+            CStr::from_bytes_with_nul_unchecked(
+                b"Maximum number of Sentry events per background worker per second\0",
+            )
+        },
+        &SENTRY_MAX_EVENTS_PER_SEC,
+        0,
+        10_000,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
 }
 
 ::pgrx::pg_module_magic!();
@@ -321,6 +475,75 @@ fn register_guc() {
 #[pg_extern]
 fn get_captured_logs_count() -> i64 {
     log_capture::get_pending_count() as i64
+}
+
+#[pg_extern]
+fn get_sentry_status() -> TableIterator<'static, (name!(key, String), name!(value, String))> {
+    let cfg = config::sentry::get_sentry_config();
+    let enabled = config::sentry::SentryAdapter::is_enabled_global();
+    let rows = vec![
+        ("enabled".to_string(), enabled.to_string()),
+        ("dsn".to_string(), cfg.dsn.clone()),
+        ("environment".to_string(), cfg.environment.clone().unwrap_or_default()),
+        ("min_level".to_string(), cfg.min_level.to_string()),
+        ("max_events_per_sec".to_string(), cfg.max_events_per_sec.to_string()),
+        ("sample_rate".to_string(), cfg.sample_rate.to_string()),
+        ("include_sql".to_string(), cfg.include_sql.to_string()),
+    ];
+    TableIterator::new(rows.into_iter().map(|(k, v)| (k, v)))
+}
+
+#[pg_extern]
+fn configure_sentry(
+    dsn: &str,
+    enabled: default!(bool, true),
+    environment: default!(&str, "''"),
+    release: default!(&str, "''"),
+    server_name: default!(&str, "''"),
+    sample_rate: default!(i32, 100),
+    min_level: default!(i32, 20),
+    include_sql: default!(bool, false),
+    send_default_pii: default!(bool, false),
+    max_events_per_sec: default!(i32, 100),
+) {
+    // Validate DSN before writing config
+    let sentry_cfg = config::sentry::SentryConfig {
+        dsn: dsn.to_string(),
+        environment: if environment.is_empty() { None } else { Some(environment.to_string()) },
+        release: if release.is_empty() { None } else { Some(release.to_string()) },
+        server_name: if server_name.is_empty() { None } else { Some(server_name.to_string()) },
+        sample_rate: (sample_rate.clamp(0, 100) as f32) / 100.0,
+        min_level,
+        include_sql,
+        send_default_pii,
+        max_events_per_sec: max_events_per_sec.max(0) as u32,
+    };
+    if let Err(e) = sentry_cfg.validate_dsn() {
+        pgrx::error!("{}", e);
+    }
+
+    // Write Sentry config to a separate JSON file that the background worker reads directly
+    let data_dir = unsafe {
+        let dir = pgrx::pg_sys::DataDir;
+        if dir.is_null() {
+            pgrx::error!("pg_turret: DataDir is null, cannot write sentry config");
+        }
+        std::ffi::CStr::from_ptr(dir).to_string_lossy().to_string()
+    };
+
+    let config_path = format!("{}/pg_turret_sentry.json", data_dir);
+    let config_json = serde_json::to_string(&sentry_cfg).unwrap();
+
+    if let Err(e) = std::fs::write(&config_path, config_json) {
+        pgrx::error!("pg_turret: Failed to write sentry config file: {}", e);
+    }
+
+    // Also set directly for the current process
+    config::sentry::SentryAdapter::set_enabled(enabled);
+    config::sentry::set_sentry_config(sentry_cfg);
+
+    // Trigger config reload in background worker via pg_reload_conf()
+    let _ = Spi::run("SELECT pg_reload_conf();");
 }
 
 #[allow(non_snake_case)]
@@ -414,6 +637,28 @@ unsafe extern "C-unwind" fn turret_shmem_startup() {
             batch_size: KAFKA_BATCH_SIZE.get() as usize,
         });
 
+        // Load Sentry config from JSON file if it exists (written by configure_sentry())
+        let data_dir = unsafe {
+            let dir = pgrx::pg_sys::DataDir;
+            if dir.is_null() {
+                None
+            } else {
+                Some(std::ffi::CStr::from_ptr(dir).to_string_lossy().to_string())
+            }
+        };
+
+        if let Some(dir) = data_dir {
+            let config_path = format!("{}/pg_turret_sentry.json", dir);
+            if let Ok(content) = std::fs::read_to_string(&config_path) {
+                if let Ok(cfg) = serde_json::from_str::<config::sentry::SentryConfig>(&content) {
+                    if !cfg.dsn.is_empty() {
+                        config::sentry::SentryAdapter::set_enabled(true);
+                        config::sentry::set_sentry_config(cfg);
+                    }
+                }
+            }
+        }
+
         log_capture::set_filter_config(log_capture::FilterConfig {
             level_min: LOG_LEVEL_MIN.get(),
             pattern: LOG_PATTERN
@@ -458,6 +703,7 @@ pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
         let adapters: Vec<&dyn Adapter> = vec![
             &*HTTP_ADAPTER as &dyn Adapter,
             &*KAFKA_ADAPTER as &dyn Adapter,
+            &*SENTRY_ADAPTER as &dyn Adapter,
         ]
         .into_iter()
         .filter(|a: &&dyn Adapter| a.is_enabled())

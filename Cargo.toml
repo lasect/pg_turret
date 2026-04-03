@@ -38,6 +38,7 @@ once_cell = "1.19"
 flate2 = "1.0"
 tungstenite = { version = "0.22", default-features = false, features = ["__rustls-tls", "handshake"] }
 url = "2.5"
+sentry = { version = "0.34", default-features = false, features = ["reqwest", "rustls"] }
 
 [dev-dependencies]
 pgrx-tests = "=0.17.0"
