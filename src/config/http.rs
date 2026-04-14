@@ -59,7 +59,10 @@ static HTTP_CONFIG: LazyLock<Mutex<HttpConfig>> =
 
 pub fn set_http_config(config: HttpConfig) {
     let mut cfg = HTTP_CONFIG.lock().expect("HTTP_CONFIG mutex poisoned");
-    let needs_rebuild = cfg.timeout_ms != config.timeout_ms;
+    let needs_rebuild = cfg.timeout_ms != config.timeout_ms
+        || cfg.endpoint != config.endpoint
+        || cfg.api_key != config.api_key
+        || cfg.compression != config.compression;
     *cfg = config;
     drop(cfg);
 

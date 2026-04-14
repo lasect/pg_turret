@@ -5,7 +5,6 @@ use kafka::producer::{Producer, Record};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::thread;
 use std::time::Duration;
 
 static KAFKA_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -89,6 +88,7 @@ impl KafkaAdapter {
     }
 
     /// Send with retry logic for transient errors like UnknownTopicOrPartition
+    /// Returns error if unrecoverable, allowing caller to retry on next poll cycle
     fn send_with_retry(
         producer: &mut Producer,
         record: &Record<'_, (), Vec<u8>>,
@@ -99,14 +99,11 @@ impl KafkaAdapter {
         let mut last_error = None;
 
         // Exponential backoff parameters (in milliseconds)
-        // These values are chosen to:
-        // - give topic auto-creation some time to complete
-        // - avoid long blocking sleeps in the background worker
-        // - cap individual delays to keep the worker responsive
+        // These values determine the next retry time the caller should wait
         const UNKNOWN_TOPIC_BASE_DELAY_MS: u64 = 500;
-        const UNKNOWN_TOPIC_MAX_DELAY_MS: u64 = 2_000;
+        const UNKNOWN_TOPIC_MAX_DELAY_MS: u64 = 2000;
         const OTHER_ERROR_BASE_DELAY_MS: u64 = 100;
-        const OTHER_ERROR_MAX_DELAY_MS: u64 = 1_000;
+        const OTHER_ERROR_MAX_DELAY_MS: u64 = 1000;
         const BACKOFF_FACTOR: u32 = 2;
 
         for attempt in 0..=max_retries {
@@ -116,40 +113,42 @@ impl KafkaAdapter {
                     let is_unknown_topic = Self::is_unknown_topic_error(&e);
                     last_error = Some(e);
 
-                    if is_unknown_topic && attempt < max_retries {
-                        // UnknownTopicOrPartition - exponential backoff with cap
-                        // This gives time for:
-                        // 1. Topic auto-creation to complete
-                        // 2. Metadata to propagate across brokers
-                        let backoff = UNKNOWN_TOPIC_BASE_DELAY_MS
-                            .saturating_mul(BACKOFF_FACTOR.saturating_pow(attempt) as u64)
-                            .min(UNKNOWN_TOPIC_MAX_DELAY_MS);
-                        let delay = Duration::from_millis(backoff);
-                        thread::sleep(delay);
-
-                        // Recreate producer to force metadata refresh
-                        match Self::create_producer(brokers, timeout_ms) {
-                            Ok(new_producer) => {
+                    if attempt < max_retries {
+                        // Calculate backoff delay but DON'T block - return error
+                        // The background worker will retry on next poll cycle
+                        if is_unknown_topic {
+                            let backoff = UNKNOWN_TOPIC_BASE_DELAY_MS
+                                .saturating_mul(BACKOFF_FACTOR.saturating_pow(attempt) as u64)
+                                .min(UNKNOWN_TOPIC_MAX_DELAY_MS);
+                            // Recreate producer to force metadata refresh for next attempt
+                            if let Ok(new_producer) = Self::create_producer(brokers, timeout_ms) {
                                 *producer = new_producer;
-                                continue;
                             }
-                            Err(e) => {
-                                return Err(AdapterError {
-                                    message: format!(
-                                        "Failed to recreate producer during retry: {}",
-                                        e.message
-                                    ),
-                                });
-                            }
+                            // Return error to allow worker to retry on next poll
+                            return Err(AdapterError {
+                                message: format!(
+                                    "Kafka topic not ready (attempt {}/{}), will retry on next poll cycle. Backoff: {}ms. Error: {}",
+                                    attempt + 1,
+                                    max_retries,
+                                    backoff,
+                                    last_error.as_ref().map(|e| format!("{}", e)).unwrap_or_default()
+                                ),
+                            });
+                        } else {
+                            // Other transient error
+                            let backoff = OTHER_ERROR_BASE_DELAY_MS
+                                .saturating_mul(BACKOFF_FACTOR.saturating_pow(attempt) as u64)
+                                .min(OTHER_ERROR_MAX_DELAY_MS);
+                            return Err(AdapterError {
+                                message: format!(
+                                    "Kafka transient error (attempt {}/{}), will retry on next poll cycle. Backoff: {}ms. Error: {}",
+                                    attempt + 1,
+                                    max_retries,
+                                    backoff,
+                                    last_error.as_ref().map(|e| format!("{}", e)).unwrap_or_default()
+                                ),
+                            });
                         }
-                    } else if attempt < max_retries {
-                        // Other transient error - exponential backoff with smaller cap
-                        let backoff = OTHER_ERROR_BASE_DELAY_MS
-                            .saturating_mul(BACKOFF_FACTOR.saturating_pow(attempt) as u64)
-                            .min(OTHER_ERROR_MAX_DELAY_MS);
-                        let delay = Duration::from_millis(backoff);
-                        thread::sleep(delay);
-                        continue;
                     }
                 }
             }
