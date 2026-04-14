@@ -4,10 +4,12 @@ use pgrx::pg_sys::{self, ErrorData};
 use pgrx::{PGRXSharedMemory, PgLwLock};
 use regex::Regex;
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+
+use crate::config::StreamType;
 
 /// Flag indicating shared memory has been initialized and the ring buffer is safe to access.
 static SHMEM_READY: AtomicBool = AtomicBool::new(false);
@@ -68,6 +70,8 @@ impl Default for RetryConfig {
 
 static RETRY_CONFIG: Lazy<Mutex<RetryConfig>> = Lazy::new(|| Mutex::new(RetryConfig::default()));
 static RETRY_QUEUE: Lazy<Mutex<VecDeque<(CapturedLog, u32)>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
+static RETRY_QUEUE_BY_ADAPTER: Lazy<Mutex<BTreeMap<StreamType, VecDeque<(CapturedLog, u32)>>>> =
+    Lazy::new(|| Mutex::new(BTreeMap::new()));
 
 pub static LOGS_CAPTURED: AtomicU64 = AtomicU64::new(0);
 pub static LOGS_DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -75,28 +79,71 @@ pub static LOGS_SENT: AtomicU64 = AtomicU64::new(0);
 pub static LOGS_RETRY_FAILED: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_filter_config(config: FilterConfig) {
-    let mut filter = FILTER_CONFIG.lock().unwrap();
+    let mut filter = match FILTER_CONFIG.lock() {
+        Ok(f) => f,
+        Err(_) => return,
+    };
     *filter = config.clone();
+    drop(filter);
     
-    // Compile include pattern
-    let mut pattern_guard = FILTER_PATTERN.lock().unwrap();
-    *pattern_guard = config.pattern.as_ref().and_then(|p| Regex::new(p).ok());
+    // Compile include pattern with error logging
+    let mut pattern_guard = match FILTER_PATTERN.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if let Some(ref p) = config.pattern {
+        match Regex::new(p) {
+            Ok(re) => *pattern_guard = Some(re),
+            Err(e) => {
+                pgrx::warning!("pg_turret: invalid filter pattern '{}': {}", p, e);
+                *pattern_guard = None;
+            }
+        }
+    } else {
+        *pattern_guard = None;
+    }
+    drop(pattern_guard);
     
-    // Compile exclude pattern
-    let mut exclude_guard = FILTER_PATTERN_EXCLUDE.lock().unwrap();
-    *exclude_guard = config.pattern_exclude.as_ref().and_then(|p| Regex::new(p).ok());
+    // Compile exclude pattern with error logging
+    let mut exclude_guard = match FILTER_PATTERN_EXCLUDE.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if let Some(ref p) = config.pattern_exclude {
+        match Regex::new(p) {
+            Ok(re) => *exclude_guard = Some(re),
+            Err(e) => {
+                pgrx::warning!("pg_turret: invalid filter pattern_exclude '{}': {}", p, e);
+                *exclude_guard = None;
+            }
+        }
+    } else {
+        *exclude_guard = None;
+    }
 }
 
 pub fn set_retry_config(config: RetryConfig) {
-    let mut retry = RETRY_CONFIG.lock().unwrap();
+    let mut retry = match RETRY_CONFIG.lock() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
     *retry = config;
 }
 
 pub fn should_capture_log(level: i32, message: &str) -> bool {
     let (config, pattern, pattern_exclude) = {
-        let cfg = FILTER_CONFIG.lock().unwrap();
-        let pat = FILTER_PATTERN.lock().unwrap();
-        let pat_ex = FILTER_PATTERN_EXCLUDE.lock().unwrap();
+        let cfg = match FILTER_CONFIG.lock() {
+            Ok(c) => c,
+            Err(_) => return true,  // Fail open if poisoned
+        };
+        let pat = match FILTER_PATTERN.lock() {
+            Ok(p) => p,
+            Err(_) => return true,
+        };
+        let pat_ex = match FILTER_PATTERN_EXCLUDE.lock() {
+            Ok(p) => p,
+            Err(_) => return true,
+        };
         (cfg.clone(), pat.clone(), pat_ex.clone())
     };
 
@@ -152,13 +199,70 @@ pub fn add_batch_to_retry_queue(logs: Vec<CapturedLog>, attempts: u32) {
 }
 
 pub fn get_retry_logs() -> Vec<(CapturedLog, u32)> {
-    let config = RETRY_CONFIG.lock().unwrap();
+    let config = match RETRY_CONFIG.lock() {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
     if !config.enabled {
         return vec![];
     }
     
-    let mut queue = RETRY_QUEUE.lock().unwrap();
+    let mut queue = match RETRY_QUEUE.lock() {
+        Ok(q) => q,
+        Err(_) => return vec![],
+    };
     queue.drain(..).collect()
+}
+
+pub fn add_batch_to_retry_queue_by_adapter(stream: StreamType, logs: Vec<CapturedLog>, attempts: u32) {
+    if logs.is_empty() {
+        return;
+    }
+    
+    let config = match RETRY_CONFIG.lock() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if !config.enabled {
+        return;
+    }
+    
+    let max_attempts = config.max_attempts;
+    if attempts >= max_attempts {
+        LOGS_RETRY_FAILED.fetch_add(logs.len() as u64, Ordering::SeqCst);
+        return;
+    }
+    
+    let mut queue_size = match RETRY_QUEUE_BY_ADAPTER.lock() {
+        Ok(q) => q,
+        Err(_) => return,
+    };
+    
+    let queue = queue_size.entry(stream).or_insert_with(VecDeque::new);
+    for log in logs {
+        if queue.len() >= config.queue_size {
+            LOGS_RETRY_FAILED.fetch_add(1, Ordering::SeqCst);
+            queue.pop_front();
+        }
+        queue.push_back((log, attempts));
+    }
+}
+
+pub fn get_retry_logs_by_adapter(stream: StreamType) -> Vec<(CapturedLog, u32)> {
+    let config = match RETRY_CONFIG.lock() {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    if !config.enabled {
+        return vec![];
+    }
+    
+    let mut queue = match RETRY_QUEUE_BY_ADAPTER.lock() {
+        Ok(q) => q,
+        Err(_) => return vec![],
+    };
+    
+    queue.remove(&stream).map(|q| q.into_iter().collect()).unwrap_or_default()
 }
 
 pub fn clear_retry_queue() {
@@ -569,7 +673,16 @@ fn build_shm_entry(ed: &ErrorData) -> ShmLogEntry {
     // The ErrorData struct itself contains some fields but not database/user names.
     // Those can be added later if needed through other means.
 
-    let query_str = unsafe { c_str_to_option(pg_sys::debug_query_string) };
+    let query_str = {
+        let ptr: *const std::ffi::c_char = unsafe { pg_sys::debug_query_string };
+        if ptr.is_null() {
+            None
+        } else {
+            // debug_query_string is a global that may be null or point to freed memory
+            // We validate by checking if the pointer is non-null and attempt conversion
+            unsafe { CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_string()) }
+        }
+    };
     let message_str = c_str_mut_to_option(ed.message).unwrap_or_default();
     let detail_str = c_str_mut_to_option(ed.detail);
     let hint_str = c_str_mut_to_option(ed.hint);
@@ -616,15 +729,20 @@ unsafe extern "C-unwind" fn emit_log_hook_func(edata: *mut pgrx::pg_sys::ErrorDa
     let level = (*edata).elevel;
     
     // Fast path: check level filter first (no string allocation)
-    let level_min = FILTER_CONFIG.lock().unwrap().level_min;
+    let level_min = match FILTER_CONFIG.lock() {
+        Ok(cfg) => cfg.level_min,
+        Err(_) => return,  // Fail open - allow log through if config poisoned
+    };
     if level < level_min {
         return;
     }
 
     // Check if pattern filtering is configured
     let needs_pattern_check = {
-        let cfg = FILTER_CONFIG.lock().unwrap();
-        cfg.pattern.is_some() || cfg.pattern_exclude.is_some()
+        match FILTER_CONFIG.lock() {
+            Ok(cfg) => cfg.pattern.is_some() || cfg.pattern_exclude.is_some(),
+            Err(_) => false,  // Fail closed - no pattern check if config unavailable
+        }
     };
 
     if needs_pattern_check {
