@@ -61,6 +61,29 @@ pub static LOG_LEVEL_MIN: GucSetting<i32> = GucSetting::<i32>::new(10);
 pub static LOG_PATTERN: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 pub static LOG_PATTERN_EXCLUDE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
+#[cfg(unix)]
+fn write_config_atomic(data_dir: &str, filename: &str, content: &str) -> Result<(), String> {
+    use std::fs;
+
+    let temp_path = format!("{}/{}.tmp.{}", data_dir, filename, std::process::id());
+    let final_path = format!("{}/{}", data_dir, filename);
+
+    // Write to temporary file
+    fs::write(&temp_path, content).map_err(|e| format!("Failed to write temp file: {}", e))?;
+
+    // Atomic rename (POSIX guarantees this is atomic)
+    fs::rename(&temp_path, &final_path).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        format!("Failed to finalize config: {}", e)
+    })
+}
+
+#[cfg(not(unix))]
+fn write_config_atomic(data_dir: &str, filename: &str, content: &str) -> Result<(), String> {
+    let final_path = format!("{}/{}", data_dir, filename);
+    std::fs::write(&final_path, content).map_err(|e| format!("Failed to write config: {}", e))
+}
+
 fn register_guc() {
     GucRegistry::define_bool_guc(
         unsafe { CStr::from_bytes_with_nul_unchecked(b"pg_turret.http.enabled\0") },
@@ -531,10 +554,10 @@ fn configure_sentry(
         std::ffi::CStr::from_ptr(dir).to_string_lossy().to_string()
     };
 
-    let config_path = format!("{}/pg_turret_sentry.json", data_dir);
+    let config_filename = "pg_turret_sentry.json";
     let config_json = serde_json::to_string(&sentry_cfg).unwrap();
 
-    if let Err(e) = std::fs::write(&config_path, config_json) {
+    if let Err(e) = write_config_atomic(&data_dir, config_filename, &config_json) {
         pgrx::error!("pg_turret: Failed to write sentry config file: {}", e);
     }
 
